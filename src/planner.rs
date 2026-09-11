@@ -14,6 +14,7 @@ const STATE_VERSION: u8 = 2;
 const ATTRIBUTION_GAP_SECS: i64 = 5 * 60;
 const RESET_TIME_TOLERANCE_SECS: i64 = 60 * 60;
 const REFILL_THRESHOLD_PERCENT: f64 = 5.0;
+const FULL_RESET_USED_PERCENT: f64 = 0.5;
 const MAX_EVENTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,10 +200,13 @@ impl PlannerState {
         // A small reset timestamp correction should never make the planner move backwards.
         let active_slot = computed_slot.max(state.active_slot).min(SLOT_COUNT - 1);
         let used_drop = state.last_used_percent - raw_used;
-        let is_refill = used_drop >= REFILL_THRESHOLD_PERCENT;
+        let returned_to_full = raw_used <= FULL_RESET_USED_PERCENT
+            && state.last_used_percent > FULL_RESET_USED_PERCENT;
+        let is_refill = used_drop >= REFILL_THRESHOLD_PERCENT || returned_to_full;
 
         // Small backwards movements are treated as quota-reporting jitter. They must not
-        // create free budget or make the displayed usage run backwards.
+        // create free budget or make the displayed usage run backwards. Returning all the
+        // way to 100% remaining is an explicit full-reset signal even if only 1% was used.
         let effective_used = if !is_refill && raw_used < state.last_used_percent {
             state.last_used_percent
         } else {
@@ -213,7 +217,6 @@ impl PlannerState {
         let previous_slot = state.active_slot;
         let previous_segment_used =
             (state.last_used_percent - state.active_start_used_percent).max(0.0);
-        let previous_plan = state.plans[previous_slot].unwrap_or(0.0);
 
         if active_slot > previous_slot {
             let close_at_used = if !is_refill
@@ -240,7 +243,7 @@ impl PlannerState {
                 kind: PlannerEventKind::QuotaRefill,
                 at_unix: now_unix,
                 slot: active_slot,
-                amount_percent: used_drop,
+                amount_percent: used_drop.max(0.0),
                 remaining_before_percent: remaining_before,
                 remaining_after_percent: remaining,
                 segment_used_before_percent: if active_slot == previous_slot {
@@ -280,9 +283,6 @@ impl PlannerState {
             }
         }
 
-        // Keep the previous plan referenced so refill events can report the pre-refill
-        // segment budget without changing the compact PlanView API later.
-        let _ = previous_plan;
         state.last_used_percent = effective_used;
         state.last_sample_unix = now_unix;
         let view = state.view(today_used, today_budget);
@@ -335,7 +335,10 @@ impl PlannerState {
 
         let mut reset_markers = [false; SLOT_COUNT];
         for event in &self.events {
-            if event.reset_at_after_unix == self.reset_at_unix && event.slot < SLOT_COUNT {
+            if event.reset_at_after_unix.abs_diff(self.reset_at_unix)
+                <= RESET_TIME_TOLERANCE_SECS as u64
+                && event.slot < SLOT_COUNT
+            {
                 reset_markers[event.slot] = true;
             }
         }
@@ -441,6 +444,33 @@ mod tests {
         assert!((state.events[0].amount_percent - 30.0).abs() < 0.001);
         assert!((state.events[0].remaining_before_percent - 50.0).abs() < 0.001);
         assert!((state.events[0].remaining_after_percent - 80.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn one_percent_remaining_then_full_reset_is_detected() {
+        let reset = 7 * DAY;
+        let now = 3 * DAY + 60;
+        let (state, _) = PlannerState::advance(None, now, reset, WEEK_MINUTES, 1.0);
+        let (state, view) = PlannerState::advance(Some(state), now + 60, reset, WEEK_MINUTES, 100.0);
+
+        assert_eq!(view.today_used, 0.0);
+        assert!((view.today_budget - 25.0).abs() < 0.001);
+        assert!(view.reset_markers[3]);
+        assert_eq!(state.events.last().unwrap().kind, PlannerEventKind::QuotaRefill);
+        assert!((state.events.last().unwrap().amount_percent - 99.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn full_reset_is_detected_even_when_only_one_percent_was_used() {
+        let reset = 7 * DAY;
+        let now = 3 * DAY + 60;
+        let (state, _) = PlannerState::advance(None, now, reset, WEEK_MINUTES, 99.0);
+        let (state, view) = PlannerState::advance(Some(state), now + 60, reset, WEEK_MINUTES, 100.0);
+
+        assert_eq!(view.today_used, 0.0);
+        assert!((view.today_budget - 25.0).abs() < 0.001);
+        assert_eq!(state.events.last().unwrap().kind, PlannerEventKind::QuotaRefill);
+        assert!((state.events.last().unwrap().amount_percent - 1.0).abs() < 0.001);
     }
 
     #[test]
