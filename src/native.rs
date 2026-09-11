@@ -56,7 +56,10 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{locale::AppLocale, model::UsageSnapshot, planner::PlanView};
+use crate::{
+    locale::AppLocale,
+    model::{LimitWindow, UsageSnapshot},
+};
 
 const CLASS_NAME: &str = "WeeklyUsageBar.Overlay";
 const WINDOW_NAME: &str = "Weekly Usage Bar";
@@ -249,6 +252,15 @@ unsafe extern "system" fn window_proc(
         WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_LBUTTONDOWN => {
+            let x = (lparam as u16) as i32;
+            let mut client = empty_rect();
+            GetClientRect(hwnd, &mut client);
+            let dpi = GetDpiForWindow(hwnd).max(96);
+            let settings_width = (24 * dpi as i32 / 96).max(24);
+            if x >= client.right - settings_width {
+                cycle_palette(hwnd);
+                return 0;
+            }
             if let Some(state) = STATE.get().and_then(|state| state.lock().ok())
                 && !state.target.is_null()
             {
@@ -315,7 +327,7 @@ fn track_codex_window() {
     let top_margin = (5.0_f32 * scale).round() as i32;
     let height = (30.0_f32 * scale).round() as i32;
     let preferred_width = if state.snapshot.weekly.is_some() {
-        300.0_f32
+        400.0_f32
     } else {
         220.0_f32
     };
@@ -408,70 +420,6 @@ fn is_main_window_candidate(style: u32, extended_style: u32) -> bool {
     style & WS_CAPTION != 0 && extended_style & WS_EX_TOOLWINDOW == 0
 }
 
-struct UsageBarLayout {
-    weekly: RECT,
-    date: RECT,
-    daily: RECT,
-}
-
-fn usage_bar_layout(width: i32, height: i32, scale: f32) -> Option<UsageBarLayout> {
-    let padding = (4.0_f32 * scale).round().max(3.0_f32) as i32;
-    let major_gap = (7.0_f32 * scale).round().max(5.0_f32) as i32;
-    let minor_gap = (4.0_f32 * scale).round().max(3.0_f32) as i32;
-    let date_width = (38.0_f32 * scale).round().max(34.0_f32) as i32;
-    let inner_width = width - padding * 2;
-    let bars_width = inner_width - major_gap - date_width - minor_gap;
-    let minimum_bars_width = (110.0_f32 * scale).round() as i32;
-    if bars_width < minimum_bars_width || height <= padding * 2 {
-        return None;
-    }
-
-    let weekly_width = (bars_width * 42 / 100).max((48.0_f32 * scale).round() as i32);
-    if weekly_width >= bars_width {
-        return None;
-    }
-    let daily_width = bars_width - weekly_width;
-    let desired_bar_height = (20.0_f32 * scale).round() as i32;
-    let bar_height = desired_bar_height.min(height - padding * 2).max(1);
-    let bar_top = (height - bar_height) / 2;
-    let bar_bottom = bar_top + bar_height;
-
-    let weekly = RECT {
-        left: padding,
-        top: bar_top,
-        right: padding + weekly_width,
-        bottom: bar_bottom,
-    };
-    let date = RECT {
-        left: weekly.right + major_gap,
-        top: 0,
-        right: weekly.right + major_gap + date_width,
-        bottom: height,
-    };
-    let daily = RECT {
-        left: date.right + minor_gap,
-        top: bar_top,
-        right: date.right + minor_gap + daily_width,
-        bottom: bar_bottom,
-    };
-
-    Some(UsageBarLayout {
-        weekly,
-        date,
-        daily,
-    })
-}
-
-fn daily_remaining_percent(plan: &PlanView) -> u8 {
-    if plan.today_budget <= f64::EPSILON {
-        return 0;
-    }
-    let remaining = (plan.today_budget - plan.today_used).max(0.0);
-    ((remaining / plan.today_budget) * 100.0)
-        .clamp(0.0, 100.0)
-        .round() as u8
-}
-
 unsafe fn paint(hwnd: HWND) {
     let mut paint: PAINTSTRUCT = std::mem::zeroed();
     let dc = BeginPaint(hwnd, &mut paint);
@@ -524,43 +472,62 @@ unsafe fn paint(hwnd: HWND) {
     let previous = SelectObject(dc, font as HGDIOBJ);
     SetBkMode(dc, TRANSPARENT as i32);
 
+    let width = client.right - client.left;
+    let settings_width = (24.0_f32 * scale).round() as i32;
+    let content_width = (width - settings_width).max(1);
+    let content = RECT {
+        left: 0,
+        top: 0,
+        right: content_width,
+        bottom: client.bottom,
+    };
     let plan = crate::planner::current_view();
-    if let Some(weekly) = snapshot.weekly.as_ref() {
-        if let Some(layout) = usage_bar_layout(client.right, client.bottom, scale) {
-            draw_percent_bar(dc, layout.weekly, Some(weekly.remaining_percent), accent);
 
-            let today = Local::now();
-            let date_text = wide(&format!("{}/{}", today.month(), today.day()));
-            let mut date_rect = layout.date;
-            SetTextColor(dc, rgb(190, 190, 190));
-            DrawTextW(
-                dc,
-                date_text.as_ptr(),
-                -1,
-                &mut date_rect,
-                DT_CENTER | DT_SINGLELINE | DT_VCENTER,
-            );
-
-            let daily_percent = plan.as_ref().map(daily_remaining_percent);
-            draw_percent_bar(dc, layout.daily, daily_percent, accent);
+    match (&snapshot.weekly, plan.as_ref()) {
+        (Some(weekly), Some(plan)) => {
+            draw_weekly_daily_bars(dc, content, weekly, plan, accent, scale);
         }
-    } else {
-        let status = wide(
-            snapshot
-                .status
-                .map(|status| locale.status_text(status))
-                .unwrap_or_else(|| locale.status_text(crate::model::UsageStatus::Retrying)),
-        );
-        let mut status_rect = client;
-        SetTextColor(dc, rgb(150, 150, 150));
-        DrawTextW(
-            dc,
-            status.as_ptr(),
-            -1,
-            &mut status_rect,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
-        );
+        (Some(weekly), None) => {
+            draw_single_quota_bar(dc, content, weekly.remaining_percent as f64, accent, scale);
+        }
+        (None, _) => {
+            if let Some(primary) = snapshot.primary.as_ref() {
+                draw_single_quota_bar(dc, content, primary.remaining_percent as f64, accent, scale);
+            } else {
+                let status = wide(
+                    snapshot
+                        .status
+                        .map(|status| locale.status_text(status))
+                        .unwrap_or_else(|| locale.status_text(crate::model::UsageStatus::Retrying)),
+                );
+                let mut status_rect = content;
+                SetTextColor(dc, rgb(150, 150, 150));
+                DrawTextW(
+                    dc,
+                    status.as_ptr(),
+                    -1,
+                    &mut status_rect,
+                    DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                );
+            }
+        }
     }
+
+    let mut dot = RECT {
+        left: client.right - settings_width,
+        top: 0,
+        right: client.right,
+        bottom: client.bottom,
+    };
+    let dot_text = wide("...");
+    SetTextColor(dc, accent);
+    DrawTextW(
+        dc,
+        dot_text.as_ptr(),
+        -1,
+        &mut dot,
+        DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+    );
 
     SelectObject(dc, previous);
     DeleteObject(font as HGDIOBJ);
@@ -568,38 +535,117 @@ unsafe fn paint(hwnd: HWND) {
     EndPaint(hwnd, &paint);
 }
 
-unsafe fn draw_percent_bar(
+unsafe fn draw_weekly_daily_bars(
     dc: *mut c_void,
     rect: RECT,
-    remaining_percent: Option<u8>,
+    weekly: &LimitWindow,
+    plan: &crate::planner::PlanView,
     accent: COLORREF,
+    scale: f32,
 ) {
+    let outer_padding = (6.0_f32 * scale).round() as i32;
+    let gap = (10.0_f32 * scale).round().max(6.0_f32) as i32;
+    let date_width = (38.0_f32 * scale).round().max(30.0_f32) as i32;
+    let left = rect.left + outer_padding;
+    let right = rect.right - outer_padding;
+    let usable = (right - left - gap - date_width).max(2);
+    let weekly_width = usable / 2;
+    let daily_width = usable - weekly_width;
+
+    let bar_height = (20.0_f32 * scale).round().max(16.0_f32) as i32;
+    let bar_top = rect.top + ((rect.bottom - rect.top - bar_height) / 2).max(0);
+    let bar_bottom = (bar_top + bar_height).min(rect.bottom);
+
+    let weekly_rect = RECT {
+        left,
+        top: bar_top,
+        right: left + weekly_width,
+        bottom: bar_bottom,
+    };
+    draw_quota_bar(dc, weekly_rect, weekly.remaining_percent as f64, accent);
+
+    let date_left = weekly_rect.right + gap;
+    let mut date_rect = RECT {
+        left: date_left,
+        top: rect.top,
+        right: date_left + date_width,
+        bottom: rect.bottom,
+    };
+    let now = Local::now();
+    let date = wide(&format!("{}/{}", now.month(), now.day()));
+    SetTextColor(dc, rgb(190, 190, 190));
+    DrawTextW(
+        dc,
+        date.as_ptr(),
+        -1,
+        &mut date_rect,
+        DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+    );
+
+    let daily_rect = RECT {
+        left: date_rect.right,
+        top: bar_top,
+        right: (date_rect.right + daily_width).min(right),
+        bottom: bar_bottom,
+    };
+    draw_quota_bar(
+        dc,
+        daily_rect,
+        daily_remaining_percent(plan.today_used, plan.today_budget),
+        accent,
+    );
+}
+
+unsafe fn draw_single_quota_bar(
+    dc: *mut c_void,
+    rect: RECT,
+    remaining_percent: f64,
+    accent: COLORREF,
+    scale: f32,
+) {
+    let padding = (6.0_f32 * scale).round() as i32;
+    let bar_height = (20.0_f32 * scale).round().max(16.0_f32) as i32;
+    let top = rect.top + ((rect.bottom - rect.top - bar_height) / 2).max(0);
+    draw_quota_bar(
+        dc,
+        RECT {
+            left: rect.left + padding,
+            top,
+            right: rect.right - padding,
+            bottom: (top + bar_height).min(rect.bottom),
+        },
+        remaining_percent,
+        accent,
+    );
+}
+
+unsafe fn draw_quota_bar(dc: *mut c_void, rect: RECT, remaining_percent: f64, accent: COLORREF) {
+    let percent = remaining_percent.clamp(0.0, 100.0);
+    let width = (rect.right - rect.left).max(0);
+    if width <= 0 || rect.bottom <= rect.top {
+        return;
+    }
+
     let track = CreateSolidBrush(rgb(61, 61, 61));
     FillRect(dc, &rect, track);
     DeleteObject(track as HGDIOBJ);
 
-    if let Some(percent) = remaining_percent {
-        let width = (rect.right - rect.left).max(0);
-        let fill_width = width * percent.clamp(0, 100) as i32 / 100;
-        if fill_width > 0 {
-            let fill = RECT {
-                left: rect.left,
-                top: rect.top,
-                right: rect.left + fill_width,
-                bottom: rect.bottom,
-            };
-            let brush = CreateSolidBrush(accent);
-            FillRect(dc, &fill, brush);
-            DeleteObject(brush as HGDIOBJ);
-        }
+    let fill_width = ((width as f64) * percent / 100.0).round() as i32;
+    if fill_width > 0 {
+        let fill = RECT {
+            left: rect.left,
+            top: rect.top,
+            right: (rect.left + fill_width).min(rect.right),
+            bottom: rect.bottom,
+        };
+        let brush = CreateSolidBrush(accent);
+        FillRect(dc, &fill, brush);
+        DeleteObject(brush as HGDIOBJ);
     }
 
-    let label = remaining_percent
-        .map(|percent| format!("{}%", percent))
-        .unwrap_or_else(|| "--".to_string());
-    let label = wide(&label);
+    let label = wide(&format!("{:.0}%", percent));
     let mut text_rect = rect;
-    SetTextColor(dc, rgb(238, 238, 238));
+    SetTextColor(dc, rgb(242, 242, 242));
     DrawTextW(
         dc,
         label.as_ptr(),
@@ -607,6 +653,18 @@ unsafe fn draw_percent_bar(
         &mut text_rect,
         DT_CENTER | DT_SINGLELINE | DT_VCENTER,
     );
+    GdiFlush();
+}
+
+fn daily_remaining_percent(today_used: f64, today_budget: f64) -> f64 {
+    if today_budget <= f64::EPSILON {
+        return if today_used <= f64::EPSILON {
+            100.0
+        } else {
+            0.0
+        };
+    }
+    ((today_budget - today_used) / today_budget * 100.0).clamp(0.0, 100.0)
 }
 
 const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
@@ -702,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn weekly_layout_prefers_300_pixels() {
+    fn weekly_only_layout_has_room_for_the_plan_text() {
         let (left, width) = overlay_layout(1_200, 1.0, 300.0).expect("layout");
         assert_eq!(width, 300);
         assert_eq!(left, 742);
@@ -722,39 +780,6 @@ mod tests {
     }
 
     #[test]
-    fn side_by_side_usage_bars_fit_compact_width() {
-        let layout = usage_bar_layout(220, 30, 1.0).expect("bar layout");
-        assert!(layout.weekly.right > layout.weekly.left);
-        assert!(layout.date.left > layout.weekly.right);
-        assert!(layout.daily.left > layout.date.left);
-        assert!(layout.daily.right <= 220);
-    }
-
-    #[test]
-    fn daily_remaining_is_normalized_to_daily_budget() {
-        let plan = PlanView {
-            active_slot: 3,
-            fill_ratios: [None; 7],
-            reset_markers: [false; 7],
-            today_budget: 16.0,
-            today_used: 4.0,
-        };
-        assert_eq!(daily_remaining_percent(&plan), 75);
-    }
-
-    #[test]
-    fn daily_remaining_clamps_overspend_to_zero() {
-        let plan = PlanView {
-            active_slot: 3,
-            fill_ratios: [None; 7],
-            reset_markers: [false; 7],
-            today_budget: 16.0,
-            today_used: 20.0,
-        };
-        assert_eq!(daily_remaining_percent(&plan), 0);
-    }
-
-    #[test]
     fn codex_main_window_is_an_attachment_candidate() {
         assert!(is_main_window_candidate(WS_CAPTION, 0));
     }
@@ -763,5 +788,18 @@ mod tests {
     fn codex_pet_tool_window_is_not_an_attachment_candidate() {
         assert!(!is_main_window_candidate(WS_CAPTION, WS_EX_TOOLWINDOW));
         assert!(!is_main_window_candidate(WS_POPUP, WS_EX_TOOLWINDOW));
+    }
+
+    #[test]
+    fn daily_remaining_uses_today_budget_as_one_hundred_percent() {
+        assert!((daily_remaining_percent(2.5, 10.0) - 75.0).abs() < 0.001);
+        assert_eq!(daily_remaining_percent(10.0, 10.0), 0.0);
+        assert_eq!(daily_remaining_percent(12.0, 10.0), 0.0);
+    }
+
+    #[test]
+    fn empty_daily_budget_is_full_until_usage_exists() {
+        assert_eq!(daily_remaining_percent(0.0, 0.0), 100.0);
+        assert_eq!(daily_remaining_percent(1.0, 0.0), 0.0);
     }
 }
