@@ -22,10 +22,11 @@ use windows_sys::Win32::{
     Graphics::{
         Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
         Gdi::{
-            BeginPaint, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER,
-            DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FillRect,
-            GdiFlush, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SelectObject,
-            SetBkMode, SetTextColor, TRANSPARENT,
+            BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET,
+            DEFAULT_PITCH, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint,
+            FF_DONTCARE, FillRect, FillRgn, GdiFlush, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS,
+            PAINTSTRUCT, RestoreDC, SaveDC, SelectClipRgn, SelectObject, SetBkMode, SetTextColor,
+            TRANSPARENT,
         },
     },
     System::{
@@ -719,30 +720,114 @@ unsafe fn draw_single_quota_bar(
 unsafe fn draw_quota_bar(dc: *mut c_void, rect: RECT, remaining_percent: f64, accent: COLORREF) {
     let percent = remaining_percent.clamp(0.0, 100.0);
     let width = (rect.right - rect.left).max(0);
-    if width <= 0 || rect.bottom <= rect.top {
+    let height = (rect.bottom - rect.top).max(0);
+    if width <= 0 || height <= 0 {
         return;
     }
 
-    let track = CreateSolidBrush(rgb(61, 61, 61));
-    FillRect(dc, &rect, track);
-    DeleteObject(track as HGDIOBJ);
+    let radius = height.max(2);
+    fill_round_rect(dc, rect, radius, rgb(82, 89, 103));
 
-    let fill_width = ((width as f64) * percent / 100.0).round() as i32;
-    if fill_width > 0 {
-        let fill = RECT {
-            left: rect.left,
-            top: rect.top,
-            right: (rect.left + fill_width).min(rect.right),
-            bottom: rect.bottom,
+    let inner = RECT {
+        left: rect.left + 1,
+        top: rect.top + 1,
+        right: rect.right - 1,
+        bottom: rect.bottom - 1,
+    };
+    let inner_height = (inner.bottom - inner.top).max(1);
+    fill_round_rect(dc, inner, inner_height, rgb(38, 43, 52));
+
+    let saved_dc = SaveDC(dc);
+    let clip = CreateRoundRectRgn(
+        inner.left,
+        inner.top,
+        inner.right + 1,
+        inner.bottom + 1,
+        inner_height,
+        inner_height,
+    );
+    if !clip.is_null() {
+        SelectClipRgn(dc, clip);
+
+        let glass_glint = RECT {
+            left: inner.left + 2,
+            top: inner.top + 1,
+            right: inner.right - 2,
+            bottom: (inner.top + 2).min(inner.bottom),
         };
-        let brush = CreateSolidBrush(accent);
-        FillRect(dc, &fill, brush);
-        DeleteObject(brush as HGDIOBJ);
+        if glass_glint.right > glass_glint.left && glass_glint.bottom > glass_glint.top {
+            let glass_brush = CreateSolidBrush(rgb(92, 99, 114));
+            FillRect(dc, &glass_glint, glass_brush);
+            DeleteObject(glass_brush as HGDIOBJ);
+        }
+
+        let glass_shadow = RECT {
+            left: inner.left + 2,
+            top: (inner.bottom - 2).max(inner.top),
+            right: inner.right - 2,
+            bottom: (inner.bottom - 1).max(inner.top),
+        };
+        if glass_shadow.right > glass_shadow.left && glass_shadow.bottom > glass_shadow.top {
+            let shadow_brush = CreateSolidBrush(rgb(27, 31, 38));
+            FillRect(dc, &glass_shadow, shadow_brush);
+            DeleteObject(shadow_brush as HGDIOBJ);
+        }
+
+        let inner_width = (inner.right - inner.left).max(0);
+        let fill_width = ((inner_width as f64) * percent / 100.0).round() as i32;
+        if fill_width > 0 {
+            let fill = RECT {
+                left: inner.left,
+                top: inner.top,
+                right: (inner.left + fill_width).min(inner.right),
+                bottom: inner.bottom,
+            };
+            let fill_brush = CreateSolidBrush(dim_color(accent, 82));
+            FillRect(dc, &fill, fill_brush);
+            DeleteObject(fill_brush as HGDIOBJ);
+
+            let fill_glint = RECT {
+                left: fill.left,
+                top: fill.top,
+                right: fill.right,
+                bottom: (fill.top + 2).min(fill.bottom),
+            };
+            let glint_brush = CreateSolidBrush(lighten_color(accent, 22));
+            FillRect(dc, &fill_glint, glint_brush);
+            DeleteObject(glint_brush as HGDIOBJ);
+
+            let fill_shadow = RECT {
+                left: fill.left,
+                top: (fill.bottom - 2).max(fill.top),
+                right: fill.right,
+                bottom: fill.bottom,
+            };
+            let fill_shadow_brush = CreateSolidBrush(dim_color(accent, 60));
+            FillRect(dc, &fill_shadow, fill_shadow_brush);
+            DeleteObject(fill_shadow_brush as HGDIOBJ);
+        }
+
+        DeleteObject(clip as HGDIOBJ);
+    }
+    if saved_dc != 0 {
+        RestoreDC(dc, saved_dc);
     }
 
     let label = wide(&format!("{:.0}%", percent));
+    let mut shadow_rect = rect;
+    shadow_rect.top += 1;
+    shadow_rect.bottom += 1;
+    SetTextColor(dc, rgb(16, 18, 22));
+    DrawTextW(
+        dc,
+        label.as_ptr(),
+        -1,
+        &mut shadow_rect,
+        DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+    );
+
     let mut text_rect = rect;
-    SetTextColor(dc, rgb(242, 242, 242));
+    SetTextColor(dc, rgb(246, 248, 252));
     DrawTextW(
         dc,
         label.as_ptr(),
@@ -751,6 +836,45 @@ unsafe fn draw_quota_bar(dc: *mut c_void, rect: RECT, remaining_percent: f64, ac
         DT_CENTER | DT_SINGLELINE | DT_VCENTER,
     );
     GdiFlush();
+}
+
+unsafe fn fill_round_rect(dc: *mut c_void, rect: RECT, radius: i32, color: COLORREF) {
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    let region = CreateRoundRectRgn(
+        rect.left,
+        rect.top,
+        rect.right + 1,
+        rect.bottom + 1,
+        radius,
+        radius,
+    );
+    if region.is_null() {
+        return;
+    }
+    let brush = CreateSolidBrush(color);
+    FillRgn(dc, region, brush);
+    DeleteObject(brush as HGDIOBJ);
+    DeleteObject(region as HGDIOBJ);
+}
+
+fn dim_color(color: COLORREF, percent: u8) -> COLORREF {
+    let scale = percent as u32;
+    let red = ((color & 0xff) * scale / 100) as u8;
+    let green = (((color >> 8) & 0xff) * scale / 100) as u8;
+    let blue = (((color >> 16) & 0xff) * scale / 100) as u8;
+    rgb(red, green, blue)
+}
+
+fn lighten_color(color: COLORREF, amount: u8) -> COLORREF {
+    let amount = amount as u32;
+    let lift = |channel: u32| -> u8 { (channel + ((255 - channel) * amount / 100)).min(255) as u8 };
+    rgb(
+        lift(color & 0xff),
+        lift((color >> 8) & 0xff),
+        lift((color >> 16) & 0xff),
+    )
 }
 
 fn daily_remaining_percent(today_used: f64, today_budget: f64) -> f64 {
@@ -925,6 +1049,12 @@ mod tests {
             OBJID_WINDOW - 1,
             CHILDID_SELF as i32,
         ));
+    }
+
+    #[test]
+    fn glass_color_helpers_keep_the_accent_controlled() {
+        assert_eq!(dim_color(rgb(100, 150, 200), 50), rgb(50, 75, 100));
+        assert_eq!(lighten_color(rgb(0, 0, 0), 20), rgb(51, 51, 51));
     }
 
     #[test]

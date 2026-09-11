@@ -15,6 +15,7 @@ start    weekly    reset       today remaining
 - The **right bar** treats today's allocated quota as 100%. If today's allocation is 16% of the weekly quota and 4 percentage points have been used today, the right bar shows `75%` because 12/16 of today's allocation remains.
 - All compact title-bar text uses **Segoe UI Variable Display Semibold** styling for a stronger, cleaner Windows 11 look.
 - Both bars are intentionally thick, with their percentages drawn inside them. There is no seven-cell strip in the UI.
+- The bars use a restrained dark faux-glass treatment: rounded capsule edges, a subtle bright rim, top glint, lower shadow, and a dimmed accent fill. It does not depend on desktop blur or Acrylic composition.
 
 The planner still divides the actual weekly rate-limit window into seven equal internal slots so it can calculate today's allocation. Those slots are calculation state only; they are not presented as seven visible days, avoiding the false impression that unobserved earlier slots had zero usage.
 
