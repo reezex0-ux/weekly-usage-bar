@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use chrono::{Datelike, Local};
 use windows_sys::Win32::{
     Foundation::{
         BOOL, COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM,
@@ -55,11 +56,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{
-    locale::AppLocale,
-    model::{LimitWindow, UsageSnapshot},
-    planner::PlanView,
-};
+use crate::{locale::AppLocale, model::UsageSnapshot, planner::PlanView};
 
 const CLASS_NAME: &str = "WeeklyUsageBar.Overlay";
 const WINDOW_NAME: &str = "Weekly Usage Bar";
@@ -252,15 +249,6 @@ unsafe extern "system" fn window_proc(
         WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_LBUTTONDOWN => {
-            let x = (lparam as u16) as i32;
-            let mut client = empty_rect();
-            GetClientRect(hwnd, &mut client);
-            let dpi = GetDpiForWindow(hwnd).max(96);
-            let settings_width = (24 * dpi as i32 / 96).max(24);
-            if x >= client.right - settings_width {
-                cycle_palette(hwnd);
-                return 0;
-            }
             if let Some(state) = STATE.get().and_then(|state| state.lock().ok())
                 && !state.target.is_null()
             {
@@ -326,13 +314,10 @@ fn track_codex_window() {
     let total_width = bounds.right - bounds.left;
     let top_margin = (5.0_f32 * scale).round() as i32;
     let height = (30.0_f32 * scale).round() as i32;
-    let preferred_width = match (
-        state.snapshot.primary.is_some(),
-        state.snapshot.weekly.is_some(),
-    ) {
-        (true, true) => 380.0_f32,
-        (false, true) => 300.0_f32,
-        _ => 220.0_f32,
+    let preferred_width = if state.snapshot.weekly.is_some() {
+        300.0_f32
+    } else {
+        220.0_f32
     };
     let Some((relative_left, width)) = overlay_layout(total_width, scale, preferred_width) else {
         CODEX_ACTIVE.store(true, Ordering::Relaxed);
@@ -423,6 +408,70 @@ fn is_main_window_candidate(style: u32, extended_style: u32) -> bool {
     style & WS_CAPTION != 0 && extended_style & WS_EX_TOOLWINDOW == 0
 }
 
+struct UsageBarLayout {
+    weekly: RECT,
+    date: RECT,
+    daily: RECT,
+}
+
+fn usage_bar_layout(width: i32, height: i32, scale: f32) -> Option<UsageBarLayout> {
+    let padding = (4.0_f32 * scale).round().max(3.0_f32) as i32;
+    let major_gap = (7.0_f32 * scale).round().max(5.0_f32) as i32;
+    let minor_gap = (4.0_f32 * scale).round().max(3.0_f32) as i32;
+    let date_width = (38.0_f32 * scale).round().max(34.0_f32) as i32;
+    let inner_width = width - padding * 2;
+    let bars_width = inner_width - major_gap - date_width - minor_gap;
+    let minimum_bars_width = (110.0_f32 * scale).round() as i32;
+    if bars_width < minimum_bars_width || height <= padding * 2 {
+        return None;
+    }
+
+    let weekly_width = (bars_width * 42 / 100).max((48.0_f32 * scale).round() as i32);
+    if weekly_width >= bars_width {
+        return None;
+    }
+    let daily_width = bars_width - weekly_width;
+    let desired_bar_height = (20.0_f32 * scale).round() as i32;
+    let bar_height = desired_bar_height.min(height - padding * 2).max(1);
+    let bar_top = (height - bar_height) / 2;
+    let bar_bottom = bar_top + bar_height;
+
+    let weekly = RECT {
+        left: padding,
+        top: bar_top,
+        right: padding + weekly_width,
+        bottom: bar_bottom,
+    };
+    let date = RECT {
+        left: weekly.right + major_gap,
+        top: 0,
+        right: weekly.right + major_gap + date_width,
+        bottom: height,
+    };
+    let daily = RECT {
+        left: date.right + minor_gap,
+        top: bar_top,
+        right: date.right + minor_gap + daily_width,
+        bottom: bar_bottom,
+    };
+
+    Some(UsageBarLayout {
+        weekly,
+        date,
+        daily,
+    })
+}
+
+fn daily_remaining_percent(plan: &PlanView) -> u8 {
+    if plan.today_budget <= f64::EPSILON {
+        return 0;
+    }
+    let remaining = (plan.today_budget - plan.today_used).max(0.0);
+    ((remaining / plan.today_budget) * 100.0)
+        .clamp(0.0, 100.0)
+        .round() as u8
+}
+
 unsafe fn paint(hwnd: HWND) {
     let mut paint: PAINTSTRUCT = std::mem::zeroed();
     let dc = BeginPaint(hwnd, &mut paint);
@@ -475,139 +524,43 @@ unsafe fn paint(hwnd: HWND) {
     let previous = SelectObject(dc, font as HGDIOBJ);
     SetBkMode(dc, TRANSPARENT as i32);
 
-    let width = client.right - client.left;
-    let settings_width = (24.0_f32 * scale).round() as i32;
-    let content_width = (width - settings_width).max(1);
     let plan = crate::planner::current_view();
-    let plan_area = if plan.is_some() {
-        (7.0_f32 * scale).round() as i32
-    } else {
-        0
-    };
-    let text_bottom = client.bottom - (5.0_f32 * scale).round() as i32 - plan_area;
-    match (&snapshot.primary, &snapshot.weekly) {
-        (Some(primary), Some(weekly)) => {
-            let gap = (10.0_f32 * scale).round() as i32;
-            let side = ((content_width - gap) / 2).max(1);
-            draw_metric(
-                dc,
-                RECT {
-                    left: 0,
-                    top: 0,
-                    right: side,
-                    bottom: text_bottom,
-                },
-                primary,
-                locale,
-                accent,
-                scale,
-                None,
-            );
-            let weekly_text = plan
-                .as_ref()
-                .map(|view| locale.weekly_plan_text(weekly, view.today_used, view.today_budget));
-            draw_metric(
-                dc,
-                RECT {
-                    left: side + gap,
-                    top: 0,
-                    right: content_width,
-                    bottom: text_bottom,
-                },
-                weekly,
-                locale,
-                accent,
-                scale,
-                weekly_text.as_deref(),
-            );
-        }
-        (Some(window), None) => draw_metric(
-            dc,
-            RECT {
-                left: 0,
-                top: 0,
-                right: content_width,
-                bottom: text_bottom,
-            },
-            window,
-            locale,
-            accent,
-            scale,
-            None,
-        ),
-        (None, Some(window)) => {
-            let weekly_text = plan
-                .as_ref()
-                .map(|view| locale.weekly_plan_text(window, view.today_used, view.today_budget));
-            draw_metric(
-                dc,
-                RECT {
-                    left: 0,
-                    top: 0,
-                    right: content_width,
-                    bottom: text_bottom,
-                },
-                window,
-                locale,
-                accent,
-                scale,
-                weekly_text.as_deref(),
-            );
-        }
-        (None, None) => {
-            let status = wide(
-                snapshot
-                    .status
-                    .map(|status| locale.status_text(status))
-                    .unwrap_or_else(|| locale.status_text(crate::model::UsageStatus::Retrying)),
-            );
-            let mut status_rect = RECT {
-                right: content_width,
-                ..client
-            };
-            SetTextColor(dc, rgb(150, 150, 150));
+    if let Some(weekly) = snapshot.weekly.as_ref() {
+        if let Some(layout) = usage_bar_layout(client.right, client.bottom, scale) {
+            draw_percent_bar(dc, layout.weekly, Some(weekly.remaining_percent), accent);
+
+            let today = Local::now();
+            let date_text = wide(&format!("{}/{}", today.month(), today.day()));
+            let mut date_rect = layout.date;
+            SetTextColor(dc, rgb(190, 190, 190));
             DrawTextW(
                 dc,
-                status.as_ptr(),
+                date_text.as_ptr(),
                 -1,
-                &mut status_rect,
+                &mut date_rect,
                 DT_CENTER | DT_SINGLELINE | DT_VCENTER,
             );
-        }
-    }
 
-    if let Some(plan) = plan.as_ref() {
-        let padding = (6.0_f32 * scale).round() as i32;
-        let bar_height = (4.0_f32 * scale).round().max(3.0_f32) as i32;
-        draw_plan_bar(
+            let daily_percent = plan.as_ref().map(daily_remaining_percent);
+            draw_percent_bar(dc, layout.daily, daily_percent, accent);
+        }
+    } else {
+        let status = wide(
+            snapshot
+                .status
+                .map(|status| locale.status_text(status))
+                .unwrap_or_else(|| locale.status_text(crate::model::UsageStatus::Retrying)),
+        );
+        let mut status_rect = client;
+        SetTextColor(dc, rgb(150, 150, 150));
+        DrawTextW(
             dc,
-            RECT {
-                left: padding,
-                top: client.bottom - bar_height - (1.0_f32 * scale).round() as i32,
-                right: content_width - padding,
-                bottom: client.bottom - (1.0_f32 * scale).round() as i32,
-            },
-            plan,
-            accent,
-            scale,
+            status.as_ptr(),
+            -1,
+            &mut status_rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
         );
     }
-
-    let mut dot = RECT {
-        left: client.right - settings_width,
-        top: 0,
-        right: client.right,
-        bottom: client.bottom,
-    };
-    let dot_text = wide("...");
-    SetTextColor(dc, accent);
-    DrawTextW(
-        dc,
-        dot_text.as_ptr(),
-        -1,
-        &mut dot,
-        DT_CENTER | DT_SINGLELINE | DT_VCENTER,
-    );
 
     SelectObject(dc, previous);
     DeleteObject(font as HGDIOBJ);
@@ -615,140 +568,45 @@ unsafe fn paint(hwnd: HWND) {
     EndPaint(hwnd, &paint);
 }
 
-unsafe fn draw_metric(
+unsafe fn draw_percent_bar(
     dc: *mut c_void,
     rect: RECT,
-    window: &LimitWindow,
-    locale: AppLocale,
+    remaining_percent: Option<u8>,
     accent: COLORREF,
-    scale: f32,
-    text_override: Option<&str>,
 ) {
-    let padding = (6.0_f32 * scale).round() as i32;
-    let text = text_override
-        .map(str::to_owned)
-        .unwrap_or_else(|| locale.metric_text(window));
-    let text = wide(&text);
-    let mut text_rect = RECT {
-        left: rect.left + padding,
-        top: rect.top,
-        right: rect.right - padding,
-        bottom: rect.bottom,
-    };
-    SetTextColor(dc, rgb(224, 224, 224));
+    let track = CreateSolidBrush(rgb(61, 61, 61));
+    FillRect(dc, &rect, track);
+    DeleteObject(track as HGDIOBJ);
+
+    if let Some(percent) = remaining_percent {
+        let width = (rect.right - rect.left).max(0);
+        let fill_width = width * percent.clamp(0, 100) as i32 / 100;
+        if fill_width > 0 {
+            let fill = RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.left + fill_width,
+                bottom: rect.bottom,
+            };
+            let brush = CreateSolidBrush(accent);
+            FillRect(dc, &fill, brush);
+            DeleteObject(brush as HGDIOBJ);
+        }
+    }
+
+    let label = remaining_percent
+        .map(|percent| format!("{}%", percent))
+        .unwrap_or_else(|| "--".to_string());
+    let label = wide(&label);
+    let mut text_rect = rect;
+    SetTextColor(dc, rgb(238, 238, 238));
     DrawTextW(
         dc,
-        text.as_ptr(),
+        label.as_ptr(),
         -1,
         &mut text_rect,
         DT_CENTER | DT_SINGLELINE | DT_VCENTER,
     );
-
-    let bar_height = (2.0_f32 * scale).round().max(2.0_f32) as i32;
-    let bar_top = rect.bottom - bar_height;
-    let full = RECT {
-        left: rect.left + padding,
-        top: bar_top,
-        right: rect.right - padding,
-        bottom: rect.bottom,
-    };
-    let track = CreateSolidBrush(rgb(61, 61, 61));
-    FillRect(dc, &full, track);
-    GdiFlush();
-    DeleteObject(track as HGDIOBJ);
-
-    let available_width = (full.right - full.left).max(0);
-    let fill_width = available_width * window.remaining_percent as i32 / 100;
-    let fill = RECT {
-        left: full.left,
-        top: full.top,
-        right: full.left + fill_width,
-        bottom: full.bottom,
-    };
-    let brush = CreateSolidBrush(accent);
-    FillRect(dc, &fill, brush);
-    GdiFlush();
-    DeleteObject(brush as HGDIOBJ);
-}
-
-unsafe fn draw_plan_bar(
-    dc: *mut c_void,
-    rect: RECT,
-    plan: &PlanView,
-    accent: COLORREF,
-    scale: f32,
-) {
-    let width = (rect.right - rect.left).max(0);
-    if width <= 0 {
-        return;
-    }
-    let gap = (1.0_f32 * scale).round().max(1.0_f32) as i32;
-    let usable = (width - gap * 6).max(7);
-    let base = usable / 7;
-    let remainder = usable % 7;
-    let track = CreateSolidBrush(rgb(61, 61, 61));
-    let mut left = rect.left;
-
-    for slot in 0..7 {
-        let cell_width = base + if slot < remainder as usize { 1 } else { 0 };
-        let cell = RECT {
-            left,
-            top: rect.top,
-            right: (left + cell_width).min(rect.right),
-            bottom: rect.bottom,
-        };
-        FillRect(dc, &cell, track);
-
-        if let Some(ratio) = plan.fill_ratios[slot] {
-            let ratio = ratio.max(0.0);
-            let fill_width = ((cell.right - cell.left) as f64 * ratio.min(1.0)).round() as i32;
-            if fill_width > 0 {
-                let fill = RECT {
-                    left: cell.left,
-                    top: cell.top,
-                    right: (cell.left + fill_width).min(cell.right),
-                    bottom: cell.bottom,
-                };
-                let color = if ratio > 1.0 {
-                    rgb(226, 84, 84)
-                } else {
-                    accent
-                };
-                let brush = CreateSolidBrush(color);
-                FillRect(dc, &fill, brush);
-                DeleteObject(brush as HGDIOBJ);
-            }
-        }
-
-        if plan.reset_markers[slot] {
-            let marker_width = (1.0_f32 * scale).round().max(1.0_f32) as i32;
-            let center = (cell.left + cell.right) / 2;
-            let marker = RECT {
-                left: center - marker_width / 2,
-                top: cell.top,
-                right: (center - marker_width / 2 + marker_width).min(cell.right),
-                bottom: cell.bottom,
-            };
-            let brush = CreateSolidBrush(rgb(238, 238, 238));
-            FillRect(dc, &marker, brush);
-            DeleteObject(brush as HGDIOBJ);
-        }
-
-        if slot == plan.active_slot {
-            let marker = RECT {
-                left: cell.left,
-                top: cell.top,
-                right: cell.right,
-                bottom: (cell.top + 1).min(cell.bottom),
-            };
-            let brush = CreateSolidBrush(accent);
-            FillRect(dc, &marker, brush);
-            DeleteObject(brush as HGDIOBJ);
-        }
-        left = cell.right + gap;
-    }
-    DeleteObject(track as HGDIOBJ);
-    GdiFlush();
 }
 
 const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
@@ -844,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn weekly_only_layout_has_room_for_the_plan_text() {
+    fn weekly_layout_prefers_300_pixels() {
         let (left, width) = overlay_layout(1_200, 1.0, 300.0).expect("layout");
         assert_eq!(width, 300);
         assert_eq!(left, 742);
@@ -861,6 +719,39 @@ mod tests {
     #[test]
     fn compact_layout_hides_instead_of_covering_menus() {
         assert_eq!(overlay_layout(500, 1.0, 220.0), None);
+    }
+
+    #[test]
+    fn side_by_side_usage_bars_fit_compact_width() {
+        let layout = usage_bar_layout(220, 30, 1.0).expect("bar layout");
+        assert!(layout.weekly.right > layout.weekly.left);
+        assert!(layout.date.left > layout.weekly.right);
+        assert!(layout.daily.left > layout.date.left);
+        assert!(layout.daily.right <= 220);
+    }
+
+    #[test]
+    fn daily_remaining_is_normalized_to_daily_budget() {
+        let plan = PlanView {
+            active_slot: 3,
+            fill_ratios: [None; 7],
+            reset_markers: [false; 7],
+            today_budget: 16.0,
+            today_used: 4.0,
+        };
+        assert_eq!(daily_remaining_percent(&plan), 75);
+    }
+
+    #[test]
+    fn daily_remaining_clamps_overspend_to_zero() {
+        let plan = PlanView {
+            active_slot: 3,
+            fill_ratios: [None; 7],
+            reset_markers: [false; 7],
+            today_budget: 16.0,
+            today_used: 20.0,
+        };
+        assert_eq!(daily_remaining_percent(&plan), 0);
     }
 
     #[test]
