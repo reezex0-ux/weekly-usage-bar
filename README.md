@@ -2,28 +2,31 @@
 
 A compact adaptive weekly quota planner for OpenAI Codex Desktop on Windows.
 
-It attaches to the unused area of the Codex title bar, reads the real Codex rate-limit window from the local `codex app-server`, and turns the weekly quota into seven compact budget cells. No separate dashboard is required.
+It attaches to the unused area of the Codex title bar, reads the real Codex rate-limit window from the local `codex app-server`, and answers two questions at a glance: how much of the weekly quota is left, and how much of today's allocated budget is left.
 
-## Current prototype
+## Current display
 
 ```text
-5h 83%                     Week 72% · today 8/14% · Sep 17
-██████████████             ███│██│█│░│░│░│░
-                                      ^ current slot
+[   63%   ]   9/11 [      75%      ]
+  weekly              today's budget
 ```
 
-The lower strip is one line split into seven cells. Each cell is one seventh of the actual Codex weekly rate-limit window, so the boundaries stay aligned with the real reset time even when the reset happens in the middle of a calendar day.
+- The **left bar** is the real remaining weekly quota. The number inside the bar is only the remaining weekly percentage.
+- The **right bar** treats today's allocated quota as 100%. If today's allocation is 16% of the weekly quota and 4 percentage points have been used today, the right bar shows `75%` because 12/16 of today's allocation remains.
+- The **date** is placed immediately to the left of the daily bar.
+- Both bars are intentionally thick, with their percentages drawn inside them. There is no seven-cell strip in the UI.
+
+The planner still divides the actual weekly rate-limit window into seven equal internal slots so it can calculate today's allocation. Those slots are calculation state only; they are not presented as seven visible days, avoiding the false impression that unobserved earlier slots had zero usage.
 
 ## Adaptive budget logic
 
-- On first run, the remaining weekly quota is divided across the current and future slots.
+- On first run, the remaining weekly quota is divided across the current and future internal slots.
 - The current slot's target stays fixed while normal usage progresses.
 - If the current slot exceeds its target, future-slot budgets shrink immediately.
 - If a slot closes under budget, the unused amount is redistributed across the remaining slots.
-- Completed cells show actual usage relative to their target.
-- The current cell shows live progress; future cells stay empty.
 - If the app was not running across a slot boundary, it does not invent historical usage.
-- A new Codex weekly reset starts a fresh seven-slot plan automatically.
+- A new Codex weekly reset starts a fresh plan automatically.
+- The daily bar always normalizes the current slot's allocation to 100%, so it directly answers "how much of today's budget is left?"
 
 Planner state is persisted locally so carry-over survives restarts.
 
@@ -35,10 +38,9 @@ Weekly Usage Bar treats a quota refill separately from a normal weekly rollover.
 - Returning all the way to 100% remaining is also treated as a full reset even when less than 5 percentage points were used. This catches cases such as 99% remaining -> 100% remaining.
 - The read-only rate-limit response also exposes the number of available reset credits. If that count drops and the quota improves within the next 10 minutes, even a small 1-point refill is confirmed and recorded as `reset_credit_used`.
 - A refill starts a new budget segment at the exact observation point. Usage from before the refill is preserved in event history but is not charged against the newly allocated budget.
-- The newly available quota is redistributed across the current and remaining cells immediately.
+- The newly available quota is redistributed across the current and remaining internal slots immediately.
 - Small backwards movements below 5 percentage points that are not a full reset and are not confirmed by a reset-credit count drop are treated as reporting/rounding jitter and do not create extra budget.
-- Reset/refill events are shown as thin markers inside the seven-cell bar.
-- If `resetAt` moves forward into a new weekly window, the planner records a `cycle_reset` event and starts a new seven-cell plan.
+- If `resetAt` moves forward into a new weekly window, the planner records a `cycle_reset` event and starts a new plan.
 - Reset-time corrections of up to one hour are treated as the same cycle so a minor backend timestamp adjustment does not wipe the plan.
 - Recent reset/refill events are retained in `planner.json` (up to 64 events) so previous consumption is not silently erased.
 
@@ -46,7 +48,7 @@ This covers both automatic/manual quota resets and reset-credit style replenishm
 
 ## Why this exists
 
-Most Codex usage tools answer **"how much is left?"**. Weekly Usage Bar is intended to answer **"how much can I spend now without burning the rest of the week?"** while using almost no screen space.
+Most Codex usage tools answer **"how much is left?"**. Weekly Usage Bar is intended to answer **"how much can I spend today without burning the rest of the week?"** while using almost no screen space.
 
 ## Data source and privacy
 
@@ -68,6 +70,12 @@ Local data is stored under:
 - Korean, Chinese, and English status text
 - One Codex window
 
+## Interaction
+
+- Left-click and drag the overlay area to drag the Codex window.
+- Double-click the overlay area to forward the title-bar double-click behavior.
+- Right-click the overlay to cycle the accent palette.
+
 ## Build
 
 Rust stable is required.
@@ -79,7 +87,7 @@ cargo build --release
 
 ## Next
 
-The seven-cell planner is now validated against the current Codex Desktop app-server and a real Windows title-bar attachment, including the weekly-only Prolite response shape. Likely next additions are hover details, configurable reserve, weighted high-work days, and a compact projected-reset remainder.
+The quota reader, adaptive planner, reset-credit handling, and compact title-bar attachment are implemented. Likely next additions are hover details, configurable reserve, and weighted high-work days.
 
 ## Attribution
 
