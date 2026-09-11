@@ -725,8 +725,8 @@ unsafe fn draw_quota_bar(dc: *mut c_void, rect: RECT, remaining_percent: f64, ac
         return;
     }
 
-    let radius = height.max(2);
-    fill_round_rect(dc, rect, radius, rgb(82, 89, 103));
+    let outer_corner = glass_corner_diameter(height);
+    fill_round_rect(dc, rect, outer_corner, rgb(112, 122, 142));
 
     let inner = RECT {
         left: rect.left + 1,
@@ -735,7 +735,8 @@ unsafe fn draw_quota_bar(dc: *mut c_void, rect: RECT, remaining_percent: f64, ac
         bottom: rect.bottom - 1,
     };
     let inner_height = (inner.bottom - inner.top).max(1);
-    fill_round_rect(dc, inner, inner_height, rgb(38, 43, 52));
+    let inner_corner = glass_corner_diameter(inner_height);
+    fill_round_rect(dc, inner, inner_corner, rgb(29, 34, 42));
 
     let saved_dc = SaveDC(dc);
     let clip = CreateRoundRectRgn(
@@ -743,38 +744,50 @@ unsafe fn draw_quota_bar(dc: *mut c_void, rect: RECT, remaining_percent: f64, ac
         inner.top,
         inner.right + 1,
         inner.bottom + 1,
-        inner_height,
-        inner_height,
+        inner_corner,
+        inner_corner,
     );
     if !clip.is_null() {
         SelectClipRgn(dc, clip);
 
+        // A stronger pane highlight gives the track a darker glass appearance without
+        // requiring acrylic blur or composition effects.
+        let upper_pane = RECT {
+            left: inner.left,
+            top: inner.top,
+            right: inner.right,
+            bottom: (inner.top + (inner_height / 2).max(3)).min(inner.bottom),
+        };
+        let upper_brush = CreateSolidBrush(rgb(45, 52, 64));
+        FillRect(dc, &upper_pane, upper_brush);
+        DeleteObject(upper_brush as HGDIOBJ);
+
         let glass_glint = RECT {
-            left: inner.left + 2,
+            left: inner.left + 3,
             top: inner.top + 1,
-            right: inner.right - 2,
+            right: inner.right - 3,
             bottom: (inner.top + 2).min(inner.bottom),
         };
         if glass_glint.right > glass_glint.left && glass_glint.bottom > glass_glint.top {
-            let glass_brush = CreateSolidBrush(rgb(92, 99, 114));
+            let glass_brush = CreateSolidBrush(rgb(134, 145, 166));
             FillRect(dc, &glass_glint, glass_brush);
             DeleteObject(glass_brush as HGDIOBJ);
         }
 
         let glass_shadow = RECT {
             left: inner.left + 2,
-            top: (inner.bottom - 2).max(inner.top),
+            top: (inner.bottom - 3).max(inner.top),
             right: inner.right - 2,
-            bottom: (inner.bottom - 1).max(inner.top),
+            bottom: inner.bottom,
         };
         if glass_shadow.right > glass_shadow.left && glass_shadow.bottom > glass_shadow.top {
-            let shadow_brush = CreateSolidBrush(rgb(27, 31, 38));
+            let shadow_brush = CreateSolidBrush(rgb(19, 23, 29));
             FillRect(dc, &glass_shadow, shadow_brush);
             DeleteObject(shadow_brush as HGDIOBJ);
         }
 
         let inner_width = (inner.right - inner.left).max(0);
-        let fill_width = ((inner_width as f64) * percent / 100.0).round() as i32;
+        let fill_width = quota_fill_width(inner_width, percent);
         if fill_width > 0 {
             let fill = RECT {
                 left: inner.left,
@@ -782,7 +795,7 @@ unsafe fn draw_quota_bar(dc: *mut c_void, rect: RECT, remaining_percent: f64, ac
                 right: (inner.left + fill_width).min(inner.right),
                 bottom: inner.bottom,
             };
-            let fill_brush = CreateSolidBrush(dim_color(accent, 82));
+            let fill_brush = CreateSolidBrush(dim_color(accent, 92));
             FillRect(dc, &fill, fill_brush);
             DeleteObject(fill_brush as HGDIOBJ);
 
@@ -790,21 +803,38 @@ unsafe fn draw_quota_bar(dc: *mut c_void, rect: RECT, remaining_percent: f64, ac
                 left: fill.left,
                 top: fill.top,
                 right: fill.right,
-                bottom: (fill.top + 2).min(fill.bottom),
+                bottom: (fill.top + 3).min(fill.bottom),
             };
-            let glint_brush = CreateSolidBrush(lighten_color(accent, 22));
+            let glint_brush = CreateSolidBrush(lighten_color(accent, 34));
             FillRect(dc, &fill_glint, glint_brush);
             DeleteObject(glint_brush as HGDIOBJ);
 
             let fill_shadow = RECT {
                 left: fill.left,
-                top: (fill.bottom - 2).max(fill.top),
+                top: (fill.bottom - 3).max(fill.top),
                 right: fill.right,
                 bottom: fill.bottom,
             };
-            let fill_shadow_brush = CreateSolidBrush(dim_color(accent, 60));
+            let fill_shadow_brush = CreateSolidBrush(dim_color(accent, 54));
             FillRect(dc, &fill_shadow, fill_shadow_brush);
             DeleteObject(fill_shadow_brush as HGDIOBJ);
+
+            // Keep the remaining edge readable when only a few percent remain. The marker
+            // sits on the true fill boundary instead of inflating the displayed quota.
+            if percent < 12.0 && percent > 0.0 {
+                let marker_x = fill.right.saturating_sub(1).max(inner.left);
+                let marker = RECT {
+                    left: marker_x,
+                    top: inner.top + 2,
+                    right: (marker_x + 2).min(inner.right),
+                    bottom: inner.bottom - 2,
+                };
+                if marker.right > marker.left && marker.bottom > marker.top {
+                    let marker_brush = CreateSolidBrush(lighten_color(accent, 58));
+                    FillRect(dc, &marker, marker_brush);
+                    DeleteObject(marker_brush as HGDIOBJ);
+                }
+            }
         }
 
         DeleteObject(clip as HGDIOBJ);
@@ -817,7 +847,7 @@ unsafe fn draw_quota_bar(dc: *mut c_void, rect: RECT, remaining_percent: f64, ac
     let mut shadow_rect = rect;
     shadow_rect.top += 1;
     shadow_rect.bottom += 1;
-    SetTextColor(dc, rgb(16, 18, 22));
+    SetTextColor(dc, rgb(9, 11, 15));
     DrawTextW(
         dc,
         label.as_ptr(),
@@ -827,7 +857,7 @@ unsafe fn draw_quota_bar(dc: *mut c_void, rect: RECT, remaining_percent: f64, ac
     );
 
     let mut text_rect = rect;
-    SetTextColor(dc, rgb(246, 248, 252));
+    SetTextColor(dc, rgb(250, 252, 255));
     DrawTextW(
         dc,
         label.as_ptr(),
@@ -836,6 +866,18 @@ unsafe fn draw_quota_bar(dc: *mut c_void, rect: RECT, remaining_percent: f64, ac
         DT_CENTER | DT_SINGLELINE | DT_VCENTER,
     );
     GdiFlush();
+}
+
+fn glass_corner_diameter(height: i32) -> i32 {
+    ((height * 2) / 3).clamp(6, height.max(6))
+}
+
+fn quota_fill_width(width: i32, percent: f64) -> i32 {
+    if width <= 0 || percent <= 0.0 {
+        0
+    } else {
+        ((width as f64) * percent.clamp(0.0, 100.0) / 100.0).round() as i32
+    }
 }
 
 unsafe fn fill_round_rect(dc: *mut c_void, rect: RECT, radius: i32, color: COLORREF) {
@@ -1049,6 +1091,14 @@ mod tests {
             OBJID_WINDOW - 1,
             CHILDID_SELF as i32,
         ));
+    }
+
+    #[test]
+    fn low_quota_keeps_true_fill_width_without_minimum_inflation() {
+        assert_eq!(quota_fill_width(160, 1.0), 2);
+        assert_eq!(quota_fill_width(160, 5.0), 8);
+        assert_eq!(quota_fill_width(160, 0.0), 0);
+        assert!(glass_corner_diameter(20) < 20);
     }
 
     #[test]
