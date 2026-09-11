@@ -75,6 +75,7 @@ Local data is stored under:
 - Left-click and drag the overlay area to drag the Codex window.
 - Double-click the overlay area to forward the title-bar double-click behavior.
 - Right-click the overlay to cycle the accent palette.
+- Window movement is tracked with Windows `EVENT_OBJECT_LOCATIONCHANGE` events for immediate attachment; a 1.5-second poll remains only as recovery fallback.
 
 ## Build
 

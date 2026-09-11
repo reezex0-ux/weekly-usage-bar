@@ -36,22 +36,25 @@ use windows_sys::Win32::{
         },
     },
     UI::{
+        Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
         HiDpi::{
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
             SetProcessDpiAwarenessContext,
         },
         Input::KeyboardAndMouse::ReleaseCapture,
         WindowsAndMessaging::{
-            CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-            DispatchMessageW, EnumWindows, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GWLP_USERDATA,
-            GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-            HCURSOR, HTCAPTION, HWND_TOP, IDC_ARROW, IsIconic, IsWindowVisible, LWA_ALPHA,
-            LoadCursorW, MA_NOACTIVATE, MSG, PostQuitMessage, RegisterClassW, SW_HIDE,
-            SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetLayeredWindowAttributes, SetTimer,
-            SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WM_DESTROY,
-            WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCCREATE,
-            WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-            WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+            CHILDID_SELF, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
+            DefWindowProcW, DispatchMessageW, EVENT_OBJECT_LOCATIONCHANGE, EnumWindows,
+            GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GWLP_USERDATA, GetClientRect, GetMessageW,
+            GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HCURSOR, HTCAPTION,
+            HWND_TOP, IDC_ARROW, IsIconic, IsWindowVisible, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE,
+            MSG, OBJID_WINDOW, PostQuitMessage, RegisterClassW, SW_HIDE, SWP_NOACTIVATE,
+            SWP_SHOWWINDOW, SendMessageW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW,
+            SetWindowPos, ShowWindow, TranslateMessage, WINEVENT_OUTOFCONTEXT,
+            WINEVENT_SKIPOWNPROCESS, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+            WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_PAINT,
+            WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_POPUP,
         },
     },
 };
@@ -65,7 +68,7 @@ const CLASS_NAME: &str = "WeeklyUsageBar.Overlay";
 const WINDOW_NAME: &str = "Weekly Usage Bar";
 const MUTEX_NAME: &str = "Local\\WeeklyUsageBar.4BC6AD61";
 const TRACK_TIMER: usize = 1;
-const TRACK_INTERVAL_MS: u32 = 250;
+const TRACK_INTERVAL_MS: u32 = 1_500;
 const LOCALE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy)]
@@ -107,6 +110,33 @@ unsafe impl Send for AppState {}
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
 static PALETTES: [Palette; 3] = [Palette::blue(), Palette::green(), Palette::purple()];
 static CODEX_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct LocationWinEventHook(HWINEVENTHOOK);
+
+impl LocationWinEventHook {
+    fn install() -> Option<Self> {
+        let hook = unsafe {
+            SetWinEventHook(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                ptr::null_mut(),
+                Some(win_event_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        (!hook.is_null()).then_some(Self(hook))
+    }
+}
+
+impl Drop for LocationWinEventHook {
+    fn drop(&mut self) {
+        unsafe {
+            UnhookWinEvent(self.0);
+        }
+    }
+}
 
 pub fn run() -> Result<()> {
     let Some(_instance) = InstanceMutex::acquire()? else {
@@ -185,6 +215,7 @@ pub fn run() -> Result<()> {
         bail!("SetTimer failed: {}", std::io::Error::last_os_error());
     }
     track_codex_window();
+    let _location_hook = LocationWinEventHook::install();
     crate::codex::start_worker();
 
     let mut message: MSG = unsafe { std::mem::zeroed() };
@@ -289,7 +320,60 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+unsafe extern "system" fn win_event_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    let target = STATE
+        .get()
+        .and_then(|state| state.lock().ok())
+        .map(|state| state.target)
+        .unwrap_or(ptr::null_mut());
+
+    if should_sync_location_event(event, hwnd, target, id_object, id_child) {
+        sync_overlay_to_target(hwnd);
+    }
+}
+
+fn should_sync_location_event(
+    event: u32,
+    hwnd: HWND,
+    target: HWND,
+    id_object: i32,
+    id_child: i32,
+) -> bool {
+    event == EVENT_OBJECT_LOCATIONCHANGE
+        && !hwnd.is_null()
+        && hwnd == target
+        && id_object == OBJID_WINDOW
+        && id_child == CHILDID_SELF as i32
+}
+
 fn track_codex_window() {
+    let Some(state_lock) = STATE.get() else {
+        return;
+    };
+    if let Ok(mut state) = state_lock.lock() {
+        let now = Instant::now();
+        if now >= state.next_locale_check {
+            let locale = AppLocale::detect();
+            if locale != state.locale {
+                state.locale = locale;
+                unsafe { InvalidateRect(state.overlay, ptr::null(), 0) };
+            }
+            state.next_locale_check = now + LOCALE_CHECK_INTERVAL;
+        }
+    }
+
+    sync_overlay_to_target(find_codex_window());
+}
+
+fn sync_overlay_to_target(target: HWND) {
     let Some(state_lock) = STATE.get() else {
         return;
     };
@@ -297,16 +381,7 @@ fn track_codex_window() {
         Ok(state) => state,
         Err(_) => return,
     };
-    let now = Instant::now();
-    if now >= state.next_locale_check {
-        let locale = AppLocale::detect();
-        if locale != state.locale {
-            state.locale = locale;
-            unsafe { InvalidateRect(state.overlay, ptr::null(), 0) };
-        }
-        state.next_locale_check = now + LOCALE_CHECK_INTERVAL;
-    }
-    let target = find_codex_window();
+
     if target.is_null() || unsafe { IsIconic(target) } != 0 {
         CODEX_ACTIVE.store(false, Ordering::Relaxed);
         state.target = target;
@@ -355,7 +430,6 @@ fn track_codex_window() {
             height,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
-        InvalidateRect(state.overlay, ptr::null(), 0);
     }
 }
 
@@ -824,6 +898,33 @@ mod tests {
     fn empty_daily_budget_is_full_until_usage_exists() {
         assert_eq!(daily_remaining_percent(0.0, 0.0), 100.0);
         assert_eq!(daily_remaining_percent(1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn location_hook_only_accepts_the_current_codex_window() {
+        let target = 0x1234usize as HWND;
+        let other = 0x5678usize as HWND;
+        assert!(should_sync_location_event(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            target,
+            target,
+            OBJID_WINDOW,
+            CHILDID_SELF as i32,
+        ));
+        assert!(!should_sync_location_event(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            other,
+            target,
+            OBJID_WINDOW,
+            CHILDID_SELF as i32,
+        ));
+        assert!(!should_sync_location_event(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            target,
+            target,
+            OBJID_WINDOW - 1,
+            CHILDID_SELF as i32,
+        ));
     }
 
     #[test]
