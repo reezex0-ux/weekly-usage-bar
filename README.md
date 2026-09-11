@@ -31,15 +31,16 @@ Planner state is persisted locally so carry-over survives restarts.
 
 Weekly Usage Bar treats a quota refill separately from a normal weekly rollover.
 
-- If `resetAt` stays in the same weekly window but used quota drops by at least 5 percentage points, the change is recorded as a `quota_refill` event.
+- If `resetAt` stays in the same weekly window and used quota drops by at least 5 percentage points, the change is recorded as a `quota_refill` event.
+- Returning all the way to 100% remaining is also treated as a full reset even when less than 5 percentage points were used. This catches cases such as 99% remaining -> 100% remaining.
 - A refill starts a new budget segment at the exact observation point. Usage from before the refill is preserved in event history but is not charged against the newly allocated budget.
 - The newly available quota is redistributed across the current and remaining cells immediately.
-- Small backwards movements below 5 percentage points are treated as reporting/rounding jitter and do not create extra budget.
+- Small backwards movements below 5 percentage points that do not return to full are treated as reporting/rounding jitter and do not create extra budget.
 - If `resetAt` moves forward into a new weekly window, the planner records a `cycle_reset` event and starts a new seven-cell plan.
 - Reset-time corrections of up to one hour are treated as the same cycle so a minor backend timestamp adjustment does not wipe the plan.
 - Recent reset/refill events are retained in `planner.json` (up to 64 events) so previous consumption is not silently erased.
 
-This is intended to cover both automatic/manual quota resets and reset-credit style replenishments without assuming that every increase in remaining quota means a brand-new week.
+This covers both automatic/manual quota resets and reset-credit style replenishments without assuming that every increase in remaining quota means a brand-new week.
 
 ## Why this exists
 
