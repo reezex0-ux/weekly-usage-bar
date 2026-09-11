@@ -44,15 +44,15 @@ impl AppLocale {
         let reset = self.reset_label(window);
         match self {
             Self::Korean => format!(
-                "주간 {}% · 오늘 {:.0}/{:.0}% · {reset}",
+                "주 {}% · {:.0}/{:.0}% · {reset}",
                 window.remaining_percent, today_used, today_budget
             ),
             Self::Chinese => format!(
-                "本周 {}% · 今日 {:.0}/{:.0}% · {reset}",
+                "周 {}% · {:.0}/{:.0}% · {reset}",
                 window.remaining_percent, today_used, today_budget
             ),
             Self::English => format!(
-                "Week {}% · today {:.0}/{:.0}% · {reset}",
+                "W {}% · {:.0}/{:.0}% · {reset}",
                 window.remaining_percent, today_used, today_budget
             ),
         }
@@ -215,7 +215,7 @@ mod tests {
         assert!(
             AppLocale::Korean
                 .weekly_plan_text(&weekly, 8.0, 14.0)
-                .starts_with("주간 94% · 오늘 8/14% · ")
+                .starts_with("주 94% · 8/14% · ")
         );
     }
 }

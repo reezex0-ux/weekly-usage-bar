@@ -326,8 +326,15 @@ fn track_codex_window() {
     let total_width = bounds.right - bounds.left;
     let top_margin = (5.0_f32 * scale).round() as i32;
     let height = (30.0_f32 * scale).round() as i32;
-    let dual_window = state.snapshot.primary.is_some() && state.snapshot.weekly.is_some();
-    let Some((relative_left, width)) = overlay_layout(total_width, scale, dual_window) else {
+    let preferred_width = match (
+        state.snapshot.primary.is_some(),
+        state.snapshot.weekly.is_some(),
+    ) {
+        (true, true) => 380.0_f32,
+        (false, true) => 300.0_f32,
+        _ => 220.0_f32,
+    };
+    let Some((relative_left, width)) = overlay_layout(total_width, scale, preferred_width) else {
         CODEX_ACTIVE.store(true, Ordering::Relaxed);
         unsafe { ShowWindow(state.overlay, SW_HIDE) };
         return;
@@ -355,10 +362,9 @@ fn track_codex_window() {
     }
 }
 
-fn overlay_layout(total_width: i32, scale: f32, dual_window: bool) -> Option<(i32, i32)> {
+fn overlay_layout(total_width: i32, scale: f32, preferred_width: f32) -> Option<(i32, i32)> {
     let left_reserve = (220.0_f32 * scale).round() as i32;
     let right_reserve = (158.0_f32 * scale).round() as i32;
-    let preferred_width = if dual_window { 380.0_f32 } else { 220.0_f32 };
     let preferred_width = (preferred_width * scale).round() as i32;
     let available_width = total_width - left_reserve - right_reserve;
     let minimum_width = (170.0_f32 * scale).round() as i32;
@@ -714,6 +720,20 @@ unsafe fn draw_plan_bar(
             }
         }
 
+        if plan.reset_markers[slot] {
+            let marker_width = (1.0_f32 * scale).round().max(1.0_f32) as i32;
+            let center = (cell.left + cell.right) / 2;
+            let marker = RECT {
+                left: center - marker_width / 2,
+                top: cell.top,
+                right: (center - marker_width / 2 + marker_width).min(cell.right),
+                bottom: cell.bottom,
+            };
+            let brush = CreateSolidBrush(rgb(238, 238, 238));
+            FillRect(dc, &marker, brush);
+            DeleteObject(brush as HGDIOBJ);
+        }
+
         if slot == plan.active_slot {
             let marker = RECT {
                 left: cell.left,
@@ -816,7 +836,7 @@ mod tests {
 
     #[test]
     fn compact_layout_is_right_aligned_and_preserves_menu_space() {
-        let (left, width) = overlay_layout(1_200, 1.0, false).expect("layout");
+        let (left, width) = overlay_layout(1_200, 1.0, 220.0).expect("layout");
         assert_eq!(width, 220);
         assert_eq!(left, 822);
         assert_eq!(1_200 - left - width, 158);
@@ -824,15 +844,23 @@ mod tests {
     }
 
     #[test]
+    fn weekly_only_layout_has_room_for_the_plan_text() {
+        let (left, width) = overlay_layout(1_200, 1.0, 300.0).expect("layout");
+        assert_eq!(width, 300);
+        assert_eq!(left, 742);
+        assert_eq!(1_200 - left - width, 158);
+    }
+
+    #[test]
     fn compact_layout_scales_with_dpi() {
-        let (left, width) = overlay_layout(1_800, 1.5, false).expect("layout");
+        let (left, width) = overlay_layout(1_800, 1.5, 220.0).expect("layout");
         assert_eq!(width, 330);
         assert_eq!(1_800 - left - width, 237);
     }
 
     #[test]
     fn compact_layout_hides_instead_of_covering_menus() {
-        assert_eq!(overlay_layout(500, 1.0, false), None);
+        assert_eq!(overlay_layout(500, 1.0, 220.0), None);
     }
 
     #[test]

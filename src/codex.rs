@@ -22,6 +22,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const RETRY_INTERVAL: Duration = Duration::from_secs(8);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(12);
+const WEEKLY_WINDOW_MINUTES: u64 = 6 * 24 * 60;
 
 pub fn start_worker() {
     thread::Builder::new()
@@ -188,17 +189,44 @@ fn parse_snapshot(response: &Value) -> Result<UsageSnapshot> {
     let limits = response
         .pointer("/result/rateLimits")
         .context("missing result.rateLimits")?;
-    let primary = parse_window(limits.get("primary"));
-    let weekly = parse_window(limits.get("secondary"));
+    let (primary, weekly) = classify_windows(
+        parse_window(limits.get("primary")),
+        parse_window(limits.get("secondary")),
+    );
     if primary.is_none() && weekly.is_none() {
         bail!("Codex returned no active quota windows");
     }
+    let available_reset_credits = response
+        .pointer("/result/rateLimitResetCredits/availableCount")
+        .and_then(Value::as_u64);
     Ok(UsageSnapshot {
         primary,
         weekly,
+        available_reset_credits,
         status: None,
         sampled_at: Some(Local::now()),
     })
+}
+
+fn classify_windows(
+    primary: Option<LimitWindow>,
+    secondary: Option<LimitWindow>,
+) -> (Option<LimitWindow>, Option<LimitWindow>) {
+    let mut windows = [primary, secondary]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let weekly_index = windows
+        .iter()
+        .enumerate()
+        .filter(|(_, window)| window.duration_minutes >= WEEKLY_WINDOW_MINUTES)
+        .max_by_key(|(_, window)| window.duration_minutes)
+        .map(|(index, _)| index);
+    let weekly = weekly_index.map(|index| windows.remove(index));
+    let primary = windows
+        .into_iter()
+        .min_by_key(|window| window.duration_minutes);
+    (primary, weekly)
 }
 
 fn parse_window(value: Option<&Value>) -> Option<LimitWindow> {
@@ -314,6 +342,9 @@ mod tests {
                         "windowDurationMins": 10080,
                         "resetsAt": 1_800_500_000
                     }
+                },
+                "rateLimitResetCredits": {
+                    "availableCount": 2
                 }
             }
         });
@@ -322,6 +353,31 @@ mod tests {
         assert_eq!(parsed.primary.as_ref().unwrap().duration_minutes, 300);
         assert_eq!(parsed.weekly.as_ref().unwrap().remaining_percent, 94);
         assert_eq!(parsed.weekly.as_ref().unwrap().duration_minutes, 10_080);
+        assert_eq!(parsed.available_reset_credits, Some(2));
+    }
+
+    #[test]
+    fn weekly_window_can_be_primary_without_a_secondary_window() {
+        let response = json!({
+            "result": {
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 37,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1_800_500_000
+                    },
+                    "secondary": null
+                },
+                "rateLimitResetCredits": {
+                    "availableCount": 3
+                }
+            }
+        });
+        let parsed = parse_snapshot(&response).expect("snapshot");
+        assert!(parsed.primary.is_none());
+        assert_eq!(parsed.weekly.as_ref().unwrap().remaining_percent, 63);
+        assert_eq!(parsed.weekly.as_ref().unwrap().duration_minutes, 10_080);
+        assert_eq!(parsed.available_reset_credits, Some(3));
     }
 
     #[test]

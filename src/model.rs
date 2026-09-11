@@ -17,6 +17,7 @@ pub enum UsageStatus {
 pub struct UsageSnapshot {
     pub primary: Option<LimitWindow>,
     pub weekly: Option<LimitWindow>,
+    pub available_reset_credits: Option<u64>,
     pub status: Option<UsageStatus>,
     pub sampled_at: Option<DateTime<Local>>,
 }
@@ -26,6 +27,7 @@ impl UsageSnapshot {
         Self {
             primary: None,
             weekly: None,
+            available_reset_credits: None,
             status: Some(UsageStatus::Connecting),
             sampled_at: None,
         }
@@ -35,6 +37,7 @@ impl UsageSnapshot {
         Self {
             primary: None,
             weekly: None,
+            available_reset_credits: None,
             status: Some(UsageStatus::Retrying),
             sampled_at: None,
         }
@@ -56,6 +59,7 @@ mod tests {
         let snapshot = UsageSnapshot::connecting();
         assert!(snapshot.primary.is_none());
         assert!(snapshot.weekly.is_none());
+        assert!(snapshot.available_reset_credits.is_none());
         assert!(snapshot.status.is_some());
     }
 }

@@ -10,11 +10,13 @@ use serde::{Deserialize, Serialize};
 use crate::model::UsageSnapshot;
 
 pub const SLOT_COUNT: usize = 7;
-const STATE_VERSION: u8 = 2;
+const STATE_VERSION: u8 = 3;
 const ATTRIBUTION_GAP_SECS: i64 = 5 * 60;
 const RESET_TIME_TOLERANCE_SECS: i64 = 60 * 60;
 const REFILL_THRESHOLD_PERCENT: f64 = 5.0;
 const FULL_RESET_USED_PERCENT: f64 = 0.5;
+const CREDIT_CONFIRMED_MIN_DROP_PERCENT: f64 = 0.5;
+const RESET_CREDIT_SIGNAL_TTL_SECS: i64 = 10 * 60;
 const MAX_EVENTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +24,7 @@ const MAX_EVENTS: usize = 64;
 pub enum PlannerEventKind {
     CycleReset,
     QuotaRefill,
+    ResetCreditUsed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,6 +49,10 @@ pub struct PlannerState {
     active_start_used_percent: f64,
     last_used_percent: f64,
     last_sample_unix: i64,
+    #[serde(default)]
+    last_reset_credit_count: Option<u64>,
+    #[serde(default)]
+    pending_reset_credit_at_unix: Option<i64>,
     plans: [Option<f64>; SLOT_COUNT],
     actuals: [Option<f64>; SLOT_COUNT],
     #[serde(default)]
@@ -91,12 +98,13 @@ pub fn update_from_snapshot(snapshot: &UsageSnapshot) {
     let Ok(mut runtime) = runtime().lock() else {
         return;
     };
-    let (state, view) = PlannerState::advance(
+    let (state, view) = PlannerState::advance_with_reset_credits(
         runtime.state.take(),
         now,
         reset.timestamp(),
         weekly.duration_minutes,
         remaining,
+        snapshot.available_reset_credits,
     );
     state.save(&crate::settings::planner_state_path());
     runtime.state = Some(state);
@@ -130,12 +138,31 @@ impl PlannerState {
         }
     }
 
+    #[cfg(test)]
     pub fn advance(
         previous: Option<Self>,
         now_unix: i64,
         reset_at_unix: i64,
         duration_minutes: u64,
         weekly_remaining_percent: f64,
+    ) -> (Self, PlanView) {
+        Self::advance_with_reset_credits(
+            previous,
+            now_unix,
+            reset_at_unix,
+            duration_minutes,
+            weekly_remaining_percent,
+            None,
+        )
+    }
+
+    fn advance_with_reset_credits(
+        previous: Option<Self>,
+        now_unix: i64,
+        reset_at_unix: i64,
+        duration_minutes: u64,
+        weekly_remaining_percent: f64,
+        available_reset_credits: Option<u64>,
     ) -> (Self, PlanView) {
         let remaining = weekly_remaining_percent.clamp(0.0, 100.0);
         let raw_used = 100.0 - remaining;
@@ -154,7 +181,8 @@ impl PlannerState {
             }
             Some(previous_state) => {
                 let previous_reset = previous_state.reset_at_unix;
-                let previous_remaining = (100.0 - previous_state.last_used_percent).clamp(0.0, 100.0);
+                let previous_remaining =
+                    (100.0 - previous_state.last_used_percent).clamp(0.0, 100.0);
                 let previous_segment_used = (previous_state.last_used_percent
                     - previous_state.active_start_used_percent)
                     .max(0.0);
@@ -165,6 +193,7 @@ impl PlannerState {
                     computed_slot,
                     raw_used,
                     remaining,
+                    available_reset_credits,
                 );
                 state.events = previous_state.events;
                 if reset_at_unix > previous_reset + RESET_TIME_TOLERANCE_SECS {
@@ -191,18 +220,35 @@ impl PlannerState {
                     computed_slot,
                     raw_used,
                     remaining,
+                    available_reset_credits,
                 );
                 let view = state.view(0.0, state.plans[computed_slot].unwrap_or(0.0));
                 return (state, view);
             }
         };
 
+        if let (Some(before), Some(after)) =
+            (state.last_reset_credit_count, available_reset_credits)
+            && after < before
+        {
+            state.pending_reset_credit_at_unix = Some(now_unix);
+        }
+        if state
+            .pending_reset_credit_at_unix
+            .is_some_and(|at| now_unix.saturating_sub(at) > RESET_CREDIT_SIGNAL_TTL_SECS)
+        {
+            state.pending_reset_credit_at_unix = None;
+        }
+
         // A small reset timestamp correction should never make the planner move backwards.
         let active_slot = computed_slot.max(state.active_slot).min(SLOT_COUNT - 1);
         let used_drop = state.last_used_percent - raw_used;
         let returned_to_full = raw_used <= FULL_RESET_USED_PERCENT
             && state.last_used_percent > FULL_RESET_USED_PERCENT;
-        let is_refill = used_drop >= REFILL_THRESHOLD_PERCENT || returned_to_full;
+        let credit_confirmed_refill = state.pending_reset_credit_at_unix.is_some()
+            && used_drop >= CREDIT_CONFIRMED_MIN_DROP_PERCENT;
+        let is_refill =
+            used_drop >= REFILL_THRESHOLD_PERCENT || returned_to_full || credit_confirmed_refill;
 
         // Small backwards movements are treated as quota-reporting jitter. They must not
         // create free budget or make the displayed usage run backwards. Returning all the
@@ -240,7 +286,11 @@ impl PlannerState {
         if is_refill {
             let remaining_before = (100.0 - state.last_used_percent).clamp(0.0, 100.0);
             state.push_event(PlannerEvent {
-                kind: PlannerEventKind::QuotaRefill,
+                kind: if credit_confirmed_refill {
+                    PlannerEventKind::ResetCreditUsed
+                } else {
+                    PlannerEventKind::QuotaRefill
+                },
                 at_unix: now_unix,
                 slot: active_slot,
                 amount_percent: used_drop.max(0.0),
@@ -262,6 +312,10 @@ impl PlannerState {
             redistribute_from(&mut state.plans, active_slot, remaining);
             state.last_used_percent = raw_used;
             state.last_sample_unix = now_unix;
+            if let Some(count) = available_reset_credits {
+                state.last_reset_credit_count = Some(count);
+            }
+            state.pending_reset_credit_at_unix = None;
 
             let today_budget = state.plans[active_slot].unwrap_or(0.0).max(0.0);
             let view = state.view(0.0, today_budget);
@@ -285,6 +339,9 @@ impl PlannerState {
 
         state.last_used_percent = effective_used;
         state.last_sample_unix = now_unix;
+        if let Some(count) = available_reset_credits {
+            state.last_reset_credit_count = Some(count);
+        }
         let view = state.view(today_used, today_budget);
         (state, view)
     }
@@ -296,6 +353,7 @@ impl PlannerState {
         active_slot: usize,
         used: f64,
         remaining: f64,
+        available_reset_credits: Option<u64>,
     ) -> Self {
         let mut plans = [None; SLOT_COUNT];
         redistribute_from(&mut plans, active_slot, remaining);
@@ -307,6 +365,8 @@ impl PlannerState {
             active_start_used_percent: used,
             last_used_percent: used,
             last_sample_unix: now_unix,
+            last_reset_credit_count: available_reset_credits,
+            pending_reset_credit_at_unix: None,
             plans,
             actuals: [None; SLOT_COUNT],
             events: Vec::new(),
@@ -451,12 +511,16 @@ mod tests {
         let reset = 7 * DAY;
         let now = 3 * DAY + 60;
         let (state, _) = PlannerState::advance(None, now, reset, WEEK_MINUTES, 1.0);
-        let (state, view) = PlannerState::advance(Some(state), now + 60, reset, WEEK_MINUTES, 100.0);
+        let (state, view) =
+            PlannerState::advance(Some(state), now + 60, reset, WEEK_MINUTES, 100.0);
 
         assert_eq!(view.today_used, 0.0);
         assert!((view.today_budget - 25.0).abs() < 0.001);
         assert!(view.reset_markers[3]);
-        assert_eq!(state.events.last().unwrap().kind, PlannerEventKind::QuotaRefill);
+        assert_eq!(
+            state.events.last().unwrap().kind,
+            PlannerEventKind::QuotaRefill
+        );
         assert!((state.events.last().unwrap().amount_percent - 99.0).abs() < 0.001);
     }
 
@@ -465,11 +529,15 @@ mod tests {
         let reset = 7 * DAY;
         let now = 3 * DAY + 60;
         let (state, _) = PlannerState::advance(None, now, reset, WEEK_MINUTES, 99.0);
-        let (state, view) = PlannerState::advance(Some(state), now + 60, reset, WEEK_MINUTES, 100.0);
+        let (state, view) =
+            PlannerState::advance(Some(state), now + 60, reset, WEEK_MINUTES, 100.0);
 
         assert_eq!(view.today_used, 0.0);
         assert!((view.today_budget - 25.0).abs() < 0.001);
-        assert_eq!(state.events.last().unwrap().kind, PlannerEventKind::QuotaRefill);
+        assert_eq!(
+            state.events.last().unwrap().kind,
+            PlannerEventKind::QuotaRefill
+        );
         assert!((state.events.last().unwrap().amount_percent - 1.0).abs() < 0.001);
     }
 
@@ -515,21 +583,71 @@ mod tests {
         assert_eq!(view.active_slot, 0);
         assert!((view.today_budget - (100.0 / 7.0)).abs() < 0.001);
         assert!(view.reset_markers[0]);
-        assert_eq!(state.events.last().unwrap().kind, PlannerEventKind::CycleReset);
+        assert_eq!(
+            state.events.last().unwrap().kind,
+            PlannerEventKind::CycleReset
+        );
     }
 
     #[test]
     fn small_reset_time_correction_preserves_the_current_cycle() {
         let reset = 7 * DAY;
         let (state, _) = PlannerState::advance(None, DAY + 60, reset, WEEK_MINUTES, 80.0);
-        let (state, view) = PlannerState::advance(
-            Some(state),
-            DAY + 120,
-            reset + 120,
-            WEEK_MINUTES,
-            79.0,
-        );
+        let (state, view) =
+            PlannerState::advance(Some(state), DAY + 120, reset + 120, WEEK_MINUTES, 79.0);
         assert_eq!(view.active_slot, 1);
         assert!(state.events.is_empty());
+    }
+
+    #[test]
+    fn reset_credit_count_confirms_a_small_refill() {
+        let reset = 7 * DAY;
+        let now = 3 * DAY + 60;
+        let (state, _) =
+            PlannerState::advance_with_reset_credits(None, now, reset, WEEK_MINUTES, 60.0, Some(3));
+        let (state, view) = PlannerState::advance_with_reset_credits(
+            Some(state),
+            now + 60,
+            reset,
+            WEEK_MINUTES,
+            61.0,
+            Some(2),
+        );
+
+        assert_eq!(view.today_used, 0.0);
+        assert!(view.reset_markers[3]);
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.events[0].kind, PlannerEventKind::ResetCreditUsed);
+        assert!((state.events[0].amount_percent - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn reset_credit_signal_survives_until_the_quota_update_arrives() {
+        let reset = 7 * DAY;
+        let now = 3 * DAY + 60;
+        let (state, _) =
+            PlannerState::advance_with_reset_credits(None, now, reset, WEEK_MINUTES, 60.0, Some(3));
+        let (state, _) = PlannerState::advance_with_reset_credits(
+            Some(state),
+            now + 30,
+            reset,
+            WEEK_MINUTES,
+            60.0,
+            Some(2),
+        );
+        assert!(state.events.is_empty());
+        assert!(state.pending_reset_credit_at_unix.is_some());
+
+        let (state, view) = PlannerState::advance_with_reset_credits(
+            Some(state),
+            now + 90,
+            reset,
+            WEEK_MINUTES,
+            61.0,
+            Some(2),
+        );
+        assert_eq!(view.today_used, 0.0);
+        assert_eq!(state.events[0].kind, PlannerEventKind::ResetCreditUsed);
+        assert!(state.pending_reset_credit_at_unix.is_none());
     }
 }
