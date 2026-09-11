@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{Datelike, Local};
+use chrono::{Datelike, Duration as ChronoDuration};
 use windows_sys::Win32::{
     Foundation::{
         BOOL, COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM,
@@ -23,9 +23,9 @@ use windows_sys::Win32::{
         Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
         Gdi::{
             BeginPaint, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER,
-            DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FW_NORMAL,
-            FillRect, GdiFlush, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-            SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+            DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FillRect,
+            GdiFlush, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SelectObject,
+            SetBkMode, SetTextColor, TRANSPARENT,
         },
     },
     System::{
@@ -327,7 +327,7 @@ fn track_codex_window() {
     let top_margin = (5.0_f32 * scale).round() as i32;
     let height = (30.0_f32 * scale).round() as i32;
     let preferred_width = if state.snapshot.weekly.is_some() {
-        400.0_f32
+        440.0_f32
     } else {
         220.0_f32
     };
@@ -452,13 +452,13 @@ unsafe fn paint(hwnd: HWND) {
     DeleteObject(background as HGDIOBJ);
 
     let font_height = -((12.0_f32 * scale).round() as i32);
-    let face = wide("Segoe UI");
+    let face = wide("Segoe UI Variable Display");
     let font = CreateFontW(
         font_height,
         0,
         0,
         0,
-        FW_NORMAL as i32,
+        600,
         0,
         0,
         0,
@@ -544,48 +544,48 @@ unsafe fn draw_weekly_daily_bars(
     scale: f32,
 ) {
     let outer_padding = (6.0_f32 * scale).round() as i32;
-    let gap = (10.0_f32 * scale).round().max(6.0_f32) as i32;
-    let date_width = (38.0_f32 * scale).round().max(30.0_f32) as i32;
+    let date_width = (34.0_f32 * scale).round().max(30.0_f32) as i32;
+    let date_gap = (4.0_f32 * scale).round().max(3.0_f32) as i32;
+    let section_gap = (10.0_f32 * scale).round().max(7.0_f32) as i32;
     let left = rect.left + outer_padding;
     let right = rect.right - outer_padding;
-    let usable = (right - left - gap - date_width).max(2);
-    let weekly_width = usable / 2;
-    let daily_width = usable - weekly_width;
+    let bars_width = (right - left - date_width * 2 - date_gap * 2 - section_gap).max(2);
+    let weekly_width = bars_width / 2;
+    let daily_width = bars_width - weekly_width;
 
     let bar_height = (20.0_f32 * scale).round().max(16.0_f32) as i32;
     let bar_top = rect.top + ((rect.bottom - rect.top - bar_height) / 2).max(0);
     let bar_bottom = (bar_top + bar_height).min(rect.bottom);
+    let (start_label, reset_label) = weekly_date_labels(weekly);
+
+    let mut start_rect = RECT {
+        left,
+        top: rect.top,
+        right: left + date_width,
+        bottom: rect.bottom,
+    };
+    draw_date_label(dc, &mut start_rect, &start_label);
 
     let weekly_rect = RECT {
-        left,
+        left: start_rect.right + date_gap,
         top: bar_top,
-        right: left + weekly_width,
+        right: start_rect.right + date_gap + weekly_width,
         bottom: bar_bottom,
     };
     draw_quota_bar(dc, weekly_rect, weekly.remaining_percent as f64, accent);
 
-    let date_left = weekly_rect.right + gap;
-    let mut date_rect = RECT {
-        left: date_left,
+    let mut reset_rect = RECT {
+        left: weekly_rect.right + date_gap,
         top: rect.top,
-        right: date_left + date_width,
+        right: weekly_rect.right + date_gap + date_width,
         bottom: rect.bottom,
     };
-    let now = Local::now();
-    let date = wide(&format!("{}/{}", now.month(), now.day()));
-    SetTextColor(dc, rgb(190, 190, 190));
-    DrawTextW(
-        dc,
-        date.as_ptr(),
-        -1,
-        &mut date_rect,
-        DT_CENTER | DT_SINGLELINE | DT_VCENTER,
-    );
+    draw_date_label(dc, &mut reset_rect, &reset_label);
 
     let daily_rect = RECT {
-        left: date_rect.right,
+        left: reset_rect.right + section_gap,
         top: bar_top,
-        right: (date_rect.right + daily_width).min(right),
+        right: (reset_rect.right + section_gap + daily_width).min(right),
         bottom: bar_bottom,
     };
     draw_quota_bar(
@@ -594,6 +594,29 @@ unsafe fn draw_weekly_daily_bars(
         daily_remaining_percent(plan.today_used, plan.today_budget),
         accent,
     );
+}
+
+unsafe fn draw_date_label(dc: *mut c_void, rect: &mut RECT, label: &str) {
+    let label = wide(label);
+    SetTextColor(dc, rgb(210, 210, 210));
+    DrawTextW(
+        dc,
+        label.as_ptr(),
+        -1,
+        rect,
+        DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+    );
+}
+
+fn weekly_date_labels(weekly: &LimitWindow) -> (String, String) {
+    let Some(reset) = weekly.resets_at.as_ref() else {
+        return ("--".to_string(), "--".to_string());
+    };
+    let start = reset.clone() - ChronoDuration::minutes(weekly.duration_minutes as i64);
+    (
+        format!("{}/{}", start.month(), start.day()),
+        format!("{}/{}", reset.month(), reset.day()),
+    )
 }
 
 unsafe fn draw_single_quota_bar(
@@ -801,5 +824,24 @@ mod tests {
     fn empty_daily_budget_is_full_until_usage_exists() {
         assert_eq!(daily_remaining_percent(0.0, 0.0), 100.0);
         assert_eq!(daily_remaining_percent(1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn weekly_dates_show_window_start_and_reset() {
+        use chrono::{Local, TimeZone};
+
+        let reset = Local
+            .with_ymd_and_hms(2026, 9, 15, 6, 0, 0)
+            .single()
+            .expect("local date");
+        let weekly = LimitWindow {
+            duration_minutes: 10_080,
+            remaining_percent: 63,
+            resets_at: Some(reset),
+        };
+        assert_eq!(
+            weekly_date_labels(&weekly),
+            ("9/8".to_string(), "9/15".to_string())
+        );
     }
 }

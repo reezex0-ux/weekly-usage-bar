@@ -7,13 +7,13 @@ It attaches to the unused area of the Codex title bar, reads the real Codex rate
 ## Current display
 
 ```text
-[   63%   ]   9/11 [      75%      ]
-  weekly              today's budget
+9/8  [   63%   ]  9/15    [      75%      ]
+start    weekly    reset       today remaining
 ```
 
-- The **left bar** is the real remaining weekly quota. The number inside the bar is only the remaining weekly percentage.
+- The **left bar** is the real remaining weekly quota. Its left date is the weekly-window start and its right date is the actual reset date.
 - The **right bar** treats today's allocated quota as 100%. If today's allocation is 16% of the weekly quota and 4 percentage points have been used today, the right bar shows `75%` because 12/16 of today's allocation remains.
-- The **date** is placed immediately to the left of the daily bar.
+- All compact title-bar text uses **Segoe UI Variable Display Semibold** styling for a stronger, cleaner Windows 11 look.
 - Both bars are intentionally thick, with their percentages drawn inside them. There is no seven-cell strip in the UI.
 
 The planner still divides the actual weekly rate-limit window into seven equal internal slots so it can calculate today's allocation. Those slots are calculation state only; they are not presented as seven visible days, avoiding the false impression that unobserved earlier slots had zero usage.
