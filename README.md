@@ -7,12 +7,12 @@ It attaches to the unused area of the Codex title bar, reads the real Codex rate
 ## Current display
 
 ```text
-9/12 [   63%   ] 9/19   17:31 [   75%   ] 17:31
-start   weekly   reset   day start  daily   day end
+9/12 [   63%   ] 9/19   R17:31 [   75%   ] +24h
+start   weekly   reset    anchor    daily    span
 ```
 
 - The **left bar** is the real remaining weekly quota. Its left date is the weekly-window start and its right date is the actual reset date.
-- The **right bar** treats the current 24-hour allocation as 100%. Its day does **not** start at midnight: it starts at the weekly reset clock time and ends 24 hours later. The start/end clock times are shown on both sides of the bar. If that allocation is 16% of the weekly quota and 4 percentage points have been used since the reset-anchored day began, the right bar shows `75%` because 12/16 remains.
+- The **right bar** treats the current 24-hour allocation as 100%. Its day does **not** start at midnight: `R17:31` means the daily budget is anchored to the weekly reset clock time, and `+24h` means the slot ends 24 hours later. This avoids making the boundary label look like the current clock. If that allocation is 16% of the weekly quota and 4 percentage points have been used since the reset-anchored day began, the right bar shows `75%` because 12/16 remains.
 - All compact title-bar text uses **Segoe UI Variable Display Semibold** styling for a stronger, cleaner Windows 11 look.
 - Both bars are intentionally thick, with their percentages drawn inside them. There is no seven-cell strip in the UI.
 - The bars use a restrained dark faux-glass treatment: rounded capsule edges, a subtle bright rim, top glint, lower shadow, and a dimmed accent fill. It does not depend on desktop blur or Acrylic composition.

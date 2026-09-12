@@ -715,17 +715,18 @@ fn weekly_date_labels(weekly: &LimitWindow) -> (String, String) {
 
 fn daily_time_labels(weekly: &LimitWindow, active_slot: usize) -> (String, String) {
     let Some(reset) = weekly.resets_at.as_ref() else {
-        return ("--:--".to_string(), "--:--".to_string());
+        return ("R--:--".to_string(), "+--".to_string());
     };
     let cycle_start = reset.clone() - ChronoDuration::minutes(weekly.duration_minutes as i64);
     let slot_minutes = (weekly.duration_minutes as i64 / crate::planner::SLOT_COUNT as i64).max(1);
     let slot = active_slot.min(crate::planner::SLOT_COUNT - 1) as i64;
     let start = cycle_start + ChronoDuration::minutes(slot_minutes * slot);
-    let end = start + ChronoDuration::minutes(slot_minutes);
-    (
-        format!("{:02}:{:02}", start.hour(), start.minute()),
-        format!("{:02}:{:02}", end.hour(), end.minute()),
-    )
+    let span = if slot_minutes % 60 == 0 {
+        format!("+{}h", slot_minutes / 60)
+    } else {
+        format!("+{}m", slot_minutes)
+    };
+    (format!("R{:02}:{:02}", start.hour(), start.minute()), span)
 }
 
 unsafe fn draw_single_quota_bar(
@@ -1160,11 +1161,11 @@ mod tests {
         );
         assert_eq!(
             daily_time_labels(&weekly, 0),
-            ("06:00".to_string(), "06:00".to_string())
+            ("R06:00".to_string(), "+24h".to_string())
         );
         assert_eq!(
             daily_time_labels(&weekly, 3),
-            ("06:00".to_string(), "06:00".to_string())
+            ("R06:00".to_string(), "+24h".to_string())
         );
     }
 }
