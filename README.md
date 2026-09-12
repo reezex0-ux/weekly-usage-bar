@@ -7,17 +7,17 @@ It attaches to the unused area of the Codex title bar, reads the real Codex rate
 ## Current display
 
 ```text
-9/8  [   63%   ]  9/15    [      75%      ]
-start    weekly    reset       today remaining
+9/12 [   63%   ] 9/19   17:31 [   75%   ] 17:31
+start   weekly   reset   day start  daily   day end
 ```
 
 - The **left bar** is the real remaining weekly quota. Its left date is the weekly-window start and its right date is the actual reset date.
-- The **right bar** treats today's allocated quota as 100%. If today's allocation is 16% of the weekly quota and 4 percentage points have been used today, the right bar shows `75%` because 12/16 of today's allocation remains.
+- The **right bar** treats the current 24-hour allocation as 100%. Its day does **not** start at midnight: it starts at the weekly reset clock time and ends 24 hours later. The start/end clock times are shown on both sides of the bar. If that allocation is 16% of the weekly quota and 4 percentage points have been used since the reset-anchored day began, the right bar shows `75%` because 12/16 remains.
 - All compact title-bar text uses **Segoe UI Variable Display Semibold** styling for a stronger, cleaner Windows 11 look.
 - Both bars are intentionally thick, with their percentages drawn inside them. There is no seven-cell strip in the UI.
 - The bars use a restrained dark faux-glass treatment: rounded capsule edges, a subtle bright rim, top glint, lower shadow, and a dimmed accent fill. It does not depend on desktop blur or Acrylic composition.
 
-The planner still divides the actual weekly rate-limit window into seven equal internal slots so it can calculate today's allocation. Those slots are calculation state only; they are not presented as seven visible days, avoiding the false impression that unobserved earlier slots had zero usage.
+The planner divides the actual weekly rate-limit window into seven equal 24-hour slots anchored to the weekly reset time. For example, a weekly cycle that begins at 17:31 uses 17:31→17:31 as each daily boundary, not 00:00→00:00. The slots remain calculation state rather than seven separate visible bars.
 
 ## Adaptive budget logic
 
@@ -27,7 +27,7 @@ The planner still divides the actual weekly rate-limit window into seven equal i
 - If a slot closes under budget, the unused amount is redistributed across the remaining slots.
 - If the app was not running across a slot boundary, it does not invent historical usage.
 - A new Codex weekly reset starts a fresh plan automatically.
-- The daily bar always normalizes the current slot's allocation to 100%, so it directly answers "how much of today's budget is left?"
+- The daily bar always normalizes the current reset-anchored 24-hour slot's allocation to 100%, so it answers "how much of this reset-day budget is left?"
 
 Planner state is persisted locally so carry-over survives restarts.
 

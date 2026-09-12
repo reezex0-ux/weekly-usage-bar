@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{Datelike, Duration as ChronoDuration};
+use chrono::{Datelike, Duration as ChronoDuration, Timelike};
 use windows_sys::Win32::{
     Foundation::{
         BOOL, COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM,
@@ -620,11 +620,13 @@ unsafe fn draw_weekly_daily_bars(
 ) {
     let outer_padding = (6.0_f32 * scale).round() as i32;
     let date_width = (34.0_f32 * scale).round().max(30.0_f32) as i32;
+    let time_width = (42.0_f32 * scale).round().max(36.0_f32) as i32;
     let date_gap = (4.0_f32 * scale).round().max(3.0_f32) as i32;
     let section_gap = (10.0_f32 * scale).round().max(7.0_f32) as i32;
     let left = rect.left + outer_padding;
     let right = rect.right - outer_padding;
-    let bars_width = (right - left - date_width * 2 - date_gap * 2 - section_gap).max(2);
+    let bars_width =
+        (right - left - date_width * 2 - time_width * 2 - date_gap * 4 - section_gap).max(2);
     let weekly_width = bars_width / 2;
     let daily_width = bars_width - weekly_width;
 
@@ -632,6 +634,7 @@ unsafe fn draw_weekly_daily_bars(
     let bar_top = rect.top + ((rect.bottom - rect.top - bar_height) / 2).max(0);
     let bar_bottom = (bar_top + bar_height).min(rect.bottom);
     let (start_label, reset_label) = weekly_date_labels(weekly);
+    let (daily_start_label, daily_end_label) = daily_time_labels(weekly, plan.active_slot);
 
     let mut start_rect = RECT {
         left,
@@ -657,10 +660,18 @@ unsafe fn draw_weekly_daily_bars(
     };
     draw_date_label(dc, &mut reset_rect, &reset_label);
 
-    let daily_rect = RECT {
+    let mut daily_start_rect = RECT {
         left: reset_rect.right + section_gap,
+        top: rect.top,
+        right: reset_rect.right + section_gap + time_width,
+        bottom: rect.bottom,
+    };
+    draw_date_label(dc, &mut daily_start_rect, &daily_start_label);
+
+    let daily_rect = RECT {
+        left: daily_start_rect.right + date_gap,
         top: bar_top,
-        right: (reset_rect.right + section_gap + daily_width).min(right),
+        right: (daily_start_rect.right + date_gap + daily_width).min(right),
         bottom: bar_bottom,
     };
     draw_quota_bar(
@@ -669,6 +680,14 @@ unsafe fn draw_weekly_daily_bars(
         daily_remaining_percent(plan.today_used, plan.today_budget),
         accent,
     );
+
+    let mut daily_end_rect = RECT {
+        left: daily_rect.right + date_gap,
+        top: rect.top,
+        right: (daily_rect.right + date_gap + time_width).min(right),
+        bottom: rect.bottom,
+    };
+    draw_date_label(dc, &mut daily_end_rect, &daily_end_label);
 }
 
 unsafe fn draw_date_label(dc: *mut c_void, rect: &mut RECT, label: &str) {
@@ -691,6 +710,21 @@ fn weekly_date_labels(weekly: &LimitWindow) -> (String, String) {
     (
         format!("{}/{}", start.month(), start.day()),
         format!("{}/{}", reset.month(), reset.day()),
+    )
+}
+
+fn daily_time_labels(weekly: &LimitWindow, active_slot: usize) -> (String, String) {
+    let Some(reset) = weekly.resets_at.as_ref() else {
+        return ("--:--".to_string(), "--:--".to_string());
+    };
+    let cycle_start = reset.clone() - ChronoDuration::minutes(weekly.duration_minutes as i64);
+    let slot_minutes = (weekly.duration_minutes as i64 / crate::planner::SLOT_COUNT as i64).max(1);
+    let slot = active_slot.min(crate::planner::SLOT_COUNT - 1) as i64;
+    let start = cycle_start + ChronoDuration::minutes(slot_minutes * slot);
+    let end = start + ChronoDuration::minutes(slot_minutes);
+    (
+        format!("{:02}:{:02}", start.hour(), start.minute()),
+        format!("{:02}:{:02}", end.hour(), end.minute()),
     )
 }
 
@@ -1123,6 +1157,14 @@ mod tests {
         assert_eq!(
             weekly_date_labels(&weekly),
             ("9/8".to_string(), "9/15".to_string())
+        );
+        assert_eq!(
+            daily_time_labels(&weekly, 0),
+            ("06:00".to_string(), "06:00".to_string())
+        );
+        assert_eq!(
+            daily_time_labels(&weekly, 3),
+            ("06:00".to_string(), "06:00".to_string())
         );
     }
 }

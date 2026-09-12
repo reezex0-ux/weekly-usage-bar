@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::UsageSnapshot;
 
 pub const SLOT_COUNT: usize = 7;
-const STATE_VERSION: u8 = 3;
+const STATE_VERSION: u8 = 4;
 const ATTRIBUTION_GAP_SECS: i64 = 5 * 60;
 const RESET_TIME_TOLERANCE_SECS: i64 = 60 * 60;
 const REFILL_THRESHOLD_PERCENT: f64 = 5.0;
@@ -118,7 +118,14 @@ pub fn current_view() -> Option<PlanView> {
 impl PlannerState {
     fn load(path: &Path) -> Option<Self> {
         let bytes = fs::read(path).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        let mut state: Self = serde_json::from_slice(&bytes).ok()?;
+        if state.version < 4 && state.active_slot == 0 {
+            state.active_start_used_percent = 0.0;
+            redistribute_from(&mut state.plans, 0, 100.0);
+            state.version = STATE_VERSION;
+            state.save(path);
+        }
+        Some(state)
     }
 
     fn save(&self, path: &Path) {
@@ -175,6 +182,10 @@ impl PlannerState {
                     && reset_at_unix.abs_diff(state.reset_at_unix)
                         <= RESET_TIME_TOLERANCE_SECS as u64 =>
             {
+                if state.version < 4 && state.active_slot == 0 {
+                    state.active_start_used_percent = 0.0;
+                    redistribute_from(&mut state.plans, 0, 100.0);
+                }
                 state.version = STATE_VERSION;
                 state.reset_at_unix = reset_at_unix;
                 state
@@ -209,7 +220,11 @@ impl PlannerState {
                         reset_at_after_unix: reset_at_unix,
                     });
                 }
-                let view = state.view(0.0, state.plans[computed_slot].unwrap_or(0.0));
+                let initial_today_used = if computed_slot == 0 { raw_used } else { 0.0 };
+                let view = state.view(
+                    initial_today_used,
+                    state.plans[computed_slot].unwrap_or(0.0),
+                );
                 return (state, view);
             }
             None => {
@@ -222,7 +237,11 @@ impl PlannerState {
                     remaining,
                     available_reset_credits,
                 );
-                let view = state.view(0.0, state.plans[computed_slot].unwrap_or(0.0));
+                let initial_today_used = if computed_slot == 0 { raw_used } else { 0.0 };
+                let view = state.view(
+                    initial_today_used,
+                    state.plans[computed_slot].unwrap_or(0.0),
+                );
                 return (state, view);
             }
         };
@@ -356,13 +375,14 @@ impl PlannerState {
         available_reset_credits: Option<u64>,
     ) -> Self {
         let mut plans = [None; SLOT_COUNT];
-        redistribute_from(&mut plans, active_slot, remaining);
+        let initial_pool = if active_slot == 0 { 100.0 } else { remaining };
+        redistribute_from(&mut plans, active_slot, initial_pool);
         Self {
             version: STATE_VERSION,
             reset_at_unix,
             duration_minutes,
             active_slot,
-            active_start_used_percent: used,
+            active_start_used_percent: if active_slot == 0 { 0.0 } else { used },
             last_used_percent: used,
             last_sample_unix: now_unix,
             last_reset_credit_count: available_reset_credits,
@@ -459,6 +479,29 @@ mod tests {
         assert_eq!(view.active_slot, 2);
         assert!((view.today_budget - 14.0).abs() < 0.001);
         assert_eq!(view.today_used, 0.0);
+    }
+
+    #[test]
+    fn first_slot_counts_usage_since_the_weekly_reset_anchor() {
+        let reset = 7 * DAY;
+        let now = 60;
+        let (_, view) = PlannerState::advance(None, now, reset, WEEK_MINUTES, 96.0);
+        assert_eq!(view.active_slot, 0);
+        assert!((view.today_budget - (100.0 / 7.0)).abs() < 0.001);
+        assert!((view.today_used - 4.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn v3_first_slot_state_migrates_to_the_reset_anchor() {
+        let reset = 7 * DAY;
+        let (mut state, _) = PlannerState::advance(None, 60, reset, WEEK_MINUTES, 96.0);
+        state.version = 3;
+        state.active_start_used_percent = 4.0;
+        redistribute_from(&mut state.plans, 0, 96.0);
+
+        let (_, view) = PlannerState::advance(Some(state), 120, reset, WEEK_MINUTES, 96.0);
+        assert!((view.today_budget - (100.0 / 7.0)).abs() < 0.001);
+        assert!((view.today_used - 4.0).abs() < 0.001);
     }
 
     #[test]
