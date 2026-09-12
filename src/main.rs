@@ -9,6 +9,7 @@ mod model;
 mod native;
 mod planner;
 mod settings;
+mod worker;
 
 use anyhow::Result;
 

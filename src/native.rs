@@ -23,10 +23,10 @@ use windows_sys::Win32::{
         Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
         Gdi::{
             BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET,
-            DEFAULT_PITCH, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint,
-            FF_DONTCARE, FillRect, FillRgn, GdiFlush, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS,
-            PAINTSTRUCT, RestoreDC, SaveDC, SelectClipRgn, SelectObject, SetBkMode, SetTextColor,
-            TRANSPARENT,
+            DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, DeleteObject,
+            DrawTextW, EndPaint, FF_DONTCARE, FillRect, FillRgn, GdiFlush, HGDIOBJ, InvalidateRect,
+            OUT_DEFAULT_PRECIS, PAINTSTRUCT, RestoreDC, SaveDC, SelectClipRgn, SelectObject,
+            SetBkMode, SetTextColor, TRANSPARENT,
         },
     },
     System::{
@@ -63,6 +63,7 @@ use windows_sys::Win32::{
 use crate::{
     locale::AppLocale,
     model::{LimitWindow, UsageSnapshot},
+    worker::WorkerStatus,
 };
 
 const CLASS_NAME: &str = "WeeklyUsageBar.Overlay";
@@ -104,6 +105,7 @@ struct AppState {
     palette_index: usize,
     locale: AppLocale,
     next_locale_check: Instant,
+    worker_status: Option<WorkerStatus>,
 }
 
 unsafe impl Send for AppState {}
@@ -209,6 +211,7 @@ pub fn run() -> Result<()> {
             palette_index: saved_settings.palette_index % PALETTES.len(),
             locale: AppLocale::detect(),
             next_locale_check: Instant::now() + LOCALE_CHECK_INTERVAL,
+            worker_status: None,
         }))
         .map_err(|_| anyhow::anyhow!("application state was already initialized"))?;
 
@@ -359,15 +362,27 @@ fn track_codex_window() {
     let Some(state_lock) = STATE.get() else {
         return;
     };
+    let worker_status = crate::worker::load_visible();
     if let Ok(mut state) = state_lock.lock() {
         let now = Instant::now();
+        let mut repaint = false;
         if now >= state.next_locale_check {
             let locale = AppLocale::detect();
             if locale != state.locale {
                 state.locale = locale;
-                unsafe { InvalidateRect(state.overlay, ptr::null(), 0) };
+                repaint = true;
             }
             state.next_locale_check = now + LOCALE_CHECK_INTERVAL;
+        }
+        if state.worker_status != worker_status {
+            state.worker_status = worker_status;
+            repaint = true;
+        } else if state.worker_status.is_some() {
+            // Elapsed time in the compact worker label advances even without a new event.
+            repaint = true;
+        }
+        if repaint {
+            unsafe { InvalidateRect(state.overlay, ptr::null(), 0) };
         }
     }
 
@@ -402,11 +417,17 @@ fn sync_overlay_to_target(target: HWND) {
     let total_width = bounds.right - bounds.left;
     let top_margin = (5.0_f32 * scale).round() as i32;
     let height = (30.0_f32 * scale).round() as i32;
-    let preferred_width = if state.snapshot.weekly.is_some() {
+    let quota_width = if state.snapshot.weekly.is_some() {
         440.0_f32
     } else {
         220.0_f32
     };
+    let preferred_width = quota_width
+        + if state.worker_status.is_some() {
+            260.0_f32
+        } else {
+            0.0_f32
+        };
     let Some((relative_left, width)) = overlay_layout(total_width, scale, preferred_width) else {
         CODEX_ACTIVE.store(true, Ordering::Relaxed);
         unsafe { ShowWindow(state.overlay, SW_HIDE) };
@@ -506,7 +527,7 @@ unsafe fn paint(hwnd: HWND) {
     let dpi = GetDpiForWindow(hwnd).max(96);
     let scale: f32 = dpi as f32 / 96.0_f32;
 
-    let (snapshot, accent, locale) = STATE
+    let (snapshot, accent, locale, worker_status) = STATE
         .get()
         .and_then(|state| state.lock().ok())
         .map(|state| {
@@ -514,12 +535,14 @@ unsafe fn paint(hwnd: HWND) {
                 state.snapshot.clone(),
                 PALETTES[state.palette_index].accent,
                 state.locale,
+                state.worker_status.clone(),
             )
         })
         .unwrap_or((
             UsageSnapshot::default(),
             PALETTES[0].accent,
             AppLocale::English,
+            None,
         ));
 
     let background = CreateSolidBrush(rgb(31, 31, 31));
@@ -557,17 +580,49 @@ unsafe fn paint(hwnd: HWND) {
         bottom: client.bottom,
     };
     let plan = crate::planner::current_view();
+    let mut quota_content = content;
+    if let Some(worker) = worker_status.as_ref() {
+        let worker_width = (250.0_f32 * scale).round() as i32;
+        let gap = (4.0_f32 * scale).round().max(3.0_f32) as i32;
+        let minimum_quota = if snapshot.weekly.is_some() {
+            (390.0_f32 * scale).round() as i32
+        } else {
+            (170.0_f32 * scale).round() as i32
+        };
+        if content_width >= worker_width + gap + minimum_quota {
+            let worker_rect = RECT {
+                left: content.left,
+                top: content.top,
+                right: content.left + worker_width,
+                bottom: content.bottom,
+            };
+            draw_worker_status(dc, worker_rect, worker, accent, scale);
+            quota_content.left = worker_rect.right + gap;
+        }
+    }
 
     match (&snapshot.weekly, plan.as_ref()) {
         (Some(weekly), Some(plan)) => {
-            draw_weekly_daily_bars(dc, content, weekly, plan, accent, scale);
+            draw_weekly_daily_bars(dc, quota_content, weekly, plan, accent, scale);
         }
         (Some(weekly), None) => {
-            draw_single_quota_bar(dc, content, weekly.remaining_percent as f64, accent, scale);
+            draw_single_quota_bar(
+                dc,
+                quota_content,
+                weekly.remaining_percent as f64,
+                accent,
+                scale,
+            );
         }
         (None, _) => {
             if let Some(primary) = snapshot.primary.as_ref() {
-                draw_single_quota_bar(dc, content, primary.remaining_percent as f64, accent, scale);
+                draw_single_quota_bar(
+                    dc,
+                    quota_content,
+                    primary.remaining_percent as f64,
+                    accent,
+                    scale,
+                );
             } else {
                 let status = wide(
                     snapshot
@@ -575,7 +630,7 @@ unsafe fn paint(hwnd: HWND) {
                         .map(|status| locale.status_text(status))
                         .unwrap_or_else(|| locale.status_text(crate::model::UsageStatus::Retrying)),
                 );
-                let mut status_rect = content;
+                let mut status_rect = quota_content;
                 SetTextColor(dc, rgb(150, 150, 150));
                 DrawTextW(
                     dc,
@@ -608,6 +663,59 @@ unsafe fn paint(hwnd: HWND) {
     DeleteObject(font as HGDIOBJ);
     GdiFlush();
     EndPaint(hwnd, &paint);
+}
+
+unsafe fn draw_worker_status(
+    dc: *mut c_void,
+    rect: RECT,
+    status: &WorkerStatus,
+    accent: COLORREF,
+    scale: f32,
+) {
+    let padding = (5.0_f32 * scale).round().max(4.0_f32) as i32;
+    let panel = RECT {
+        left: rect.left + padding,
+        top: rect.top + padding,
+        right: rect.right - padding,
+        bottom: rect.bottom - padding,
+    };
+    if panel.right <= panel.left || panel.bottom <= panel.top {
+        return;
+    }
+    fill_round_rect(
+        dc,
+        panel,
+        glass_corner_diameter(panel.bottom - panel.top),
+        rgb(38, 44, 54),
+    );
+
+    let marker_width = (3.0_f32 * scale).round().max(2.0_f32) as i32;
+    let marker = RECT {
+        left: panel.left,
+        top: panel.top + 2,
+        right: (panel.left + marker_width).min(panel.right),
+        bottom: panel.bottom - 2,
+    };
+    let marker_brush = CreateSolidBrush(accent);
+    FillRect(dc, &marker, marker_brush);
+    DeleteObject(marker_brush as HGDIOBJ);
+
+    let label = wide(&status.compact_label(crate::worker::now_millis()));
+    let text_padding = (7.0_f32 * scale).round().max(5.0_f32) as i32;
+    let mut text_rect = RECT {
+        left: panel.left + text_padding,
+        top: panel.top,
+        right: panel.right - text_padding,
+        bottom: panel.bottom,
+    };
+    SetTextColor(dc, rgb(235, 238, 244));
+    DrawTextW(
+        dc,
+        label.as_ptr(),
+        -1,
+        &mut text_rect,
+        DT_CENTER | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER,
+    );
 }
 
 unsafe fn draw_weekly_daily_bars(

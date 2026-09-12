@@ -46,6 +46,10 @@ pub fn planner_state_path() -> PathBuf {
     data_directory().join("planner.json")
 }
 
+pub fn worker_status_path() -> PathBuf {
+    data_directory().join("worker-status.json")
+}
+
 fn settings_path() -> PathBuf {
     data_directory().join("settings.json")
 }
